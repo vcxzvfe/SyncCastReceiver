@@ -35,6 +35,10 @@ public final class ControlServer: @unchecked Sendable {
     private var connection: NWConnection?
     private var framer = LineFramer()
     private var peerDescription = "?"
+    /// Whether `peerDescription` has been resolved from the connection's
+    /// negotiated path AND passed the private-network check. Nothing the peer
+    /// says is acted on until it has.
+    private var peerValidated = false
 
     public private(set) var boundPort: UInt16 = 0
 
@@ -105,6 +109,7 @@ public final class ControlServer: @unchecked Sendable {
         queue.sync {
             connection?.cancel()
             connection = nil
+            peerValidated = false
             listener?.cancel()
             listener = nil
         }
@@ -128,6 +133,7 @@ public final class ControlServer: @unchecked Sendable {
             }
             connection.cancel()
             self.connection = nil
+            self.peerValidated = false
             self.handler(.disconnected(peer: self.peerDescription))
         }
     }
@@ -135,12 +141,6 @@ public final class ControlServer: @unchecked Sendable {
     // MARK: - connection handling
 
     private func accept(_ incoming: NWConnection) {
-        let peer = NetworkEndpointHost.host(of: incoming.endpoint) ?? "?"
-        guard PeerFilter.isAllowed(address: peer) else {
-            handler(.rejected(peer: peer, reason: "peer is not on a private network"))
-            incoming.cancel()
-            return
-        }
         if let existing = connection {
             if let data = try? ControlCodec.encode(.error(ErrorMessage(message: "replaced by a new sender"))) {
                 existing.send(content: data, completion: .contentProcessed { _ in })
@@ -149,30 +149,57 @@ public final class ControlServer: @unchecked Sendable {
             handler(.disconnected(peer: peerDescription))
         }
         connection = incoming
-        peerDescription = peer
+        // A provisional description only, for a log line about a connection
+        // that dies before it is ready. The peer the daemon ACTS on is
+        // resolved in `validate`, once the kernel has a negotiated path.
+        peerDescription = NetworkEndpointHost.host(of: incoming.endpoint) ?? "?"
+        peerValidated = false
         framer.reset()
         incoming.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
+            guard let self, self.connection === incoming else { return }
             switch state {
             case .ready:
-                self.handler(.connected(peer: peer))
+                _ = self.validate(incoming)
             case .failed, .cancelled:
-                if self.connection === incoming {
-                    self.connection = nil
-                    self.handler(.disconnected(peer: peer))
-                }
+                self.connection = nil
+                self.peerValidated = false
+                self.handler(.disconnected(peer: self.peerDescription))
             default:
                 break
             }
         }
         incoming.start(queue: queue)
-        receive(on: incoming, peer: peer)
+        receive(on: incoming)
     }
 
-    private func receive(on connection: NWConnection, peer: String) {
+    /// Resolve the real peer address and apply the private-network filter.
+    ///
+    /// Idempotent, and called from both `.ready` and the read loop, because
+    /// the daemon must never act on bytes from a peer it has not judged and
+    /// the two events have no guaranteed order. Returns false when the
+    /// connection was rejected and cancelled.
+    private func validate(_ incoming: NWConnection) -> Bool {
+        guard connection === incoming else { return false }
+        if peerValidated { return true }
+        let peer = NetworkEndpointHost.remoteHost(of: incoming) ?? "?"
+        peerDescription = peer
+        guard PeerFilter.isAllowed(address: peer) else {
+            handler(.rejected(peer: peer, reason: "peer is not on a private network"))
+            connection = nil
+            incoming.cancel()
+            return false
+        }
+        peerValidated = true
+        handler(.connected(peer: peer))
+        return true
+    }
+
+    private func receive(on connection: NWConnection) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
-            guard let self else { return }
+            guard let self, self.connection === connection else { return }
             if let data, !data.isEmpty {
+                guard self.validate(connection) else { return }
+                let peer = self.peerDescription
                 do {
                     for line in try self.framer.append(data) {
                         do {
@@ -192,12 +219,13 @@ public final class ControlServer: @unchecked Sendable {
             if isComplete || error != nil {
                 if self.connection === connection {
                     self.connection = nil
-                    self.handler(.disconnected(peer: peer))
+                    self.peerValidated = false
+                    self.handler(.disconnected(peer: self.peerDescription))
                 }
                 connection.cancel()
                 return
             }
-            self.receive(on: connection, peer: peer)
+            self.receive(on: connection)
         }
     }
 }

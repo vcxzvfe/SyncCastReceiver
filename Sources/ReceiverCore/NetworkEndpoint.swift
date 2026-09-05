@@ -5,6 +5,22 @@ import Network
 /// Network.framework and BSD sockets describe the same address differently.
 public enum NetworkEndpointHost {
 
+    /// The address at the far end of a connection.
+    ///
+    /// `NWConnection.endpoint` is NOT reliable for a connection handed to a
+    /// listener's `newConnectionHandler`: it can describe the endpoint the
+    /// listener is bound to rather than the peer, which is how a sender on
+    /// another machine came to be logged as `127.0.0.1`. `currentPath`
+    /// carries the addresses the kernel actually negotiated, so it is the
+    /// truth — but it is only populated once the connection is `.ready`,
+    /// hence the fallback.
+    public static func remoteHost(of connection: NWConnection) -> String? {
+        if let path = connection.currentPath, let host = host(of: path.remoteEndpoint) {
+            return host
+        }
+        return host(of: connection.endpoint)
+    }
+
     public static func host(of endpoint: NWEndpoint?) -> String? {
         guard let endpoint else { return nil }
         guard case .hostPort(let host, _) = endpoint else { return nil }
