@@ -36,6 +36,39 @@ public final class JitterBuffer: @unchecked Sendable {
         /// Render calls that ran past the newest written frame and got
         /// silence.
         public var underrun: Int = 0
+        /// Packets whose frames overlapped audio the ring already holds.
+        ///
+        /// A correct sender cannot produce one: every packet comes from a
+        /// distinct span of its capture ring. Two packets claiming the same
+        /// playout frames means the sender is running two timelines at once
+        /// — which is exactly the fault a two-machine run found, and which
+        /// sounded like two copies of the music playing over each other. The
+        /// second copy is refused rather than written over the first.
+        public var overlap: Int = 0
+        /// Packets stamped more than `farFutureNanos` beyond the newest
+        /// frame the ring holds.
+        ///
+        /// Not the same as a discontinuity: a sender that restarts its clock
+        /// lands within one ring and is re-anchored onto. This is a
+        /// timestamp no schedule can absorb, and accepting it would park the
+        /// stream seconds in the future.
+        public var farFuture: Int = 0
+    }
+
+    /// How far ahead of the newest buffered frame a packet may be stamped
+    /// before it is refused outright.
+    ///
+    /// Two seconds is far beyond any jitter buffer this receiver will ever
+    /// run (the target tops out at 300 ms) and beyond the ring itself, so
+    /// nothing legitimate reaches it. A genuine restart after a long silence
+    /// does not: `PlayoutEngine` resets the stream on the idle edge, so the
+    /// first packet back anchors from scratch rather than being measured
+    /// against a schedule that stopped seconds ago.
+    public static let farFutureNanos: Double = 2_000_000_000
+
+    /// `farFutureNanos` in frames at a given rate.
+    public static func farFutureFrames(sampleRate: Double) -> Int64 {
+        Int64((farFutureNanos / 1_000_000_000 * sampleRate).rounded())
     }
 
     public let channelCount: Int
@@ -50,8 +83,19 @@ public final class JitterBuffer: @unchecked Sendable {
     private let anchorGeneration: UnsafeMutablePointer<SCRAtomicI64>
 
     private enum CounterSlot: Int, CaseIterable {
-        case accepted, late, lost, duplicate, reordered, underrun
+        case accepted, late, lost, duplicate, reordered, underrun, overlap, farFuture
     }
+
+    /// One byte per ring frame: 1 when that frame holds audio a packet
+    /// actually delivered, 0 when it is a zero-filled hole or has never been
+    /// written. Producer-owned, so no atomics — the render thread never looks
+    /// at it, it only reads samples.
+    ///
+    /// This is what makes the overlap test exact. Without it "a packet landed
+    /// below the write head" cannot be told apart from "a reordered packet
+    /// arrived to fill the hole left for it", and those two need opposite
+    /// answers.
+    private let occupancy: UnsafeMutablePointer<UInt8>
 
     /// Producer-owned state (UDP thread only).
     private var streamID: UInt32?
@@ -87,12 +131,17 @@ public final class JitterBuffer: @unchecked Sendable {
         self.anchorNanos = makeAtoms(1, 0)
         self.anchorGeneration = makeAtoms(1, 0)
         self.recentSeq = [Int64](repeating: -1, count: Self.recentSeqSlots)
+        let marks = UnsafeMutablePointer<UInt8>.allocate(capacity: capacityFrames)
+        marks.initialize(repeating: 0, count: capacityFrames)
+        self.occupancy = marks
     }
 
     deinit {
         for p in storage { p.deinitialize(count: capacityFrames); p.deallocate() }
         writeEnd.deallocate(); readCursor.deallocate(); counters.deallocate()
         anchorNanos.deallocate(); anchorGeneration.deallocate()
+        occupancy.deinitialize(count: capacityFrames)
+        occupancy.deallocate()
     }
 
     // MARK: - Observation
@@ -105,6 +154,8 @@ public final class JitterBuffer: @unchecked Sendable {
         c.duplicate = Int(load(.duplicate))
         c.reordered = Int(load(.reordered))
         c.underrun = Int(load(.underrun))
+        c.overlap = Int(load(.overlap))
+        c.farFuture = Int(load(.farFuture))
         return c
     }
 
@@ -134,6 +185,10 @@ public final class JitterBuffer: @unchecked Sendable {
         case late
         case duplicate
         case restarted(index: Int64)
+        /// Refused: its frames overlap audio the ring already holds.
+        case overlap
+        /// Refused: stamped further than `farFutureNanos` ahead of the ring.
+        case farFuture
     }
 
     /// Write one decoded packet into the ring.
@@ -161,11 +216,19 @@ public final class JitterBuffer: @unchecked Sendable {
 
         let index = frameIndex(forPlayAtNanos: header.playAtNanos)
         let end = index + Int64(frames)
+        let currentEnd = scr_atomic_load_acquire(writeEnd)
+
+        // A timestamp this far ahead is not a discontinuity to recover from,
+        // it is a number no schedule can hold. Refuse it before the re-anchor
+        // path below can park the whole stream seconds in the future.
+        if index > currentEnd + Self.farFutureFrames(sampleRate: sampleRate) {
+            bump(.farFuture)
+            return .farFuture
+        }
 
         // A timestamp further than one ring away from what we already hold
         // is not reordering, it is a discontinuity (sender restarted its
         // clock stamping, or we slept). Re-anchor on it.
-        let currentEnd = scr_atomic_load_acquire(writeEnd)
         if index < currentEnd - Int64(capacityFrames) || index > currentEnd + Int64(capacityFrames) {
             resetStreamState(streamID: header.streamID)
             scr_atomic_store_release(anchorNanos, Int64(bitPattern: header.playAtNanos))
@@ -187,6 +250,16 @@ public final class JitterBuffer: @unchecked Sendable {
         if end <= cursor {
             bump(.late)
             return .late
+        }
+
+        // Two packets may never claim the same playout frames. A packet that
+        // lands below the write head is legitimate ONLY when it is filling a
+        // hole that was zero-filled for it; anything else is a second
+        // timeline, and writing it would mix two copies of the programme.
+        if index < currentEnd,
+           holdsAudio(from: max(index, cursor), to: min(end, currentEnd)) {
+            bump(.overlap)
+            return .overlap
         }
 
         if index > currentEnd {
@@ -303,6 +376,7 @@ public final class JitterBuffer: @unchecked Sendable {
         scr_atomic_store_release(writeEnd, 0)
         scr_atomic_store_release(readCursor, Self.unanchoredCursor)
         for ch in 0..<channelCount { storage[ch].update(repeating: 0, count: capacityFrames) }
+        occupancy.update(repeating: 0, count: capacityFrames)
     }
 
     public func resetCounters() {
@@ -322,7 +396,23 @@ public final class JitterBuffer: @unchecked Sendable {
             for ch in 0..<channelCount {
                 storage[ch][slot] = Float(samples[f * channelCount + ch]) * scale
             }
+            occupancy[slot] = 1
         }
+    }
+
+    /// Whether any frame in `[from, to)` already holds delivered audio.
+    private func holdsAudio(from: Int64, to: Int64) -> Bool {
+        let cap = Int64(capacityFrames)
+        guard to > from else { return false }
+        // A span longer than the ring cannot be reasoned about; the callers
+        // above have already rejected those, but clamp rather than run off.
+        let start = max(from, to - cap)
+        var frame = start
+        while frame < to {
+            if occupancy[Int(frame & (cap - 1))] != 0 { return true }
+            frame += 1
+        }
+        return false
     }
 
     private func zeroFrames(from: Int64, to: Int64) {
@@ -333,6 +423,9 @@ public final class JitterBuffer: @unchecked Sendable {
         for f in 0..<Int(span) {
             let slot = Int((start &+ Int64(f)) & (cap - 1))
             for ch in 0..<channelCount { storage[ch][slot] = 0 }
+            // A hole is NOT audio: a packet that turns up late may still
+            // fill it, and must not be mistaken for an overlap.
+            occupancy[slot] = 0
         }
     }
 

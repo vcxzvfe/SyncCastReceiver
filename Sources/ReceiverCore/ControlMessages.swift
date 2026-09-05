@@ -106,6 +106,14 @@ public struct StatsMessage: Codable, Equatable, Sendable {
     /// The target this receiver is ACTUALLY running at, which may be above
     /// the one the sender asked for. See `TargetLatencyPolicy`.
     public var targetMs: Double
+    /// Packets refused because their frames overlapped audio already
+    /// buffered. Non-zero means the SENDER is running two timelines at once,
+    /// which is a sender bug and not a link condition — it is reported back
+    /// so the sender's own diagnostics can say so.
+    public var overlap: Int
+    /// Packets refused because they were stamped more than two seconds ahead
+    /// of the newest frame buffered.
+    public var farFuture: Int
 
     enum CodingKeys: String, CodingKey {
         case late, lost, underrun, ratio, clip
@@ -114,17 +122,22 @@ public struct StatsMessage: Codable, Equatable, Sendable {
         case reanchorError = "reanchor_error"
         case p95JitterMs = "p95_jitter_ms"
         case targetMs = "target_ms"
+        case overlap
+        case farFuture = "far_future"
     }
 
     public init(late: Int, lost: Int, underrun: Int, bufferMs: Double, ratio: Double, clip: Int,
                 reanchorStarved: Int = 0, reanchorError: Int = 0,
-                p95JitterMs: Double? = nil, targetMs: Double = 0) {
+                p95JitterMs: Double? = nil, targetMs: Double = 0,
+                overlap: Int = 0, farFuture: Int = 0) {
         self.late = late; self.lost = lost; self.underrun = underrun
         self.bufferMs = bufferMs; self.ratio = ratio; self.clip = clip
         self.reanchorStarved = reanchorStarved
         self.reanchorError = reanchorError
         self.p95JitterMs = p95JitterMs
         self.targetMs = targetMs
+        self.overlap = overlap
+        self.farFuture = farFuture
     }
 
     /// Decoded leniently: every field added after v1 defaults rather than
@@ -141,6 +154,8 @@ public struct StatsMessage: Codable, Equatable, Sendable {
         reanchorError = try container.decodeIfPresent(Int.self, forKey: .reanchorError) ?? 0
         p95JitterMs = try container.decodeIfPresent(Double.self, forKey: .p95JitterMs)
         targetMs = try container.decodeIfPresent(Double.self, forKey: .targetMs) ?? 0
+        overlap = try container.decodeIfPresent(Int.self, forKey: .overlap) ?? 0
+        farFuture = try container.decodeIfPresent(Int.self, forKey: .farFuture) ?? 0
     }
 }
 

@@ -143,15 +143,58 @@ final class JitterBufferTests: XCTestCase {
         XCTAssertEqual(buffer.anchorPlayAtNanos, other.playAtNanos(index: 0))
     }
 
-    func testWildTimestampRestartsRatherThanCorruptingTheRing() {
+    func testWildTimestampIsRefusedRatherThanCorruptingTheRing() {
         let buffer = makeBuffer()
+        let endBefore = buffer.writeEndFrame
+        let anchorBefore = buffer.anchorPlayAtNanos
         var wild = source
         wild.startNanos = source.startNanos &+ 60_000_000_000    // a minute into the future
         var samples = wild.samples(index: 0)
         let outcome = samples.withUnsafeMutableBufferPointer {
             buffer.ingest(header: wild.header(index: 0, seq: 5000), samples: $0.baseAddress!)
         }
-        XCTAssertEqual(outcome, .restarted(index: 0))
+        // A minute ahead is not a discontinuity to recover from; re-anchoring
+        // onto it would park the whole stream in the future. It is refused,
+        // counted, and the running stream is left exactly as it was.
+        XCTAssertEqual(outcome, .farFuture)
+        XCTAssertEqual(buffer.counterSnapshot.farFuture, 1)
+        XCTAssertEqual(buffer.writeEndFrame, endBefore)
+        XCTAssertEqual(buffer.anchorPlayAtNanos, anchorBefore)
+    }
+
+    func testAPacketOverlappingBufferedAudioIsRefused() {
+        let buffer = makeBuffer()
+        // The fixture has put packet 0 in the ring. Re-stamping a
+        // DIFFERENT payload for frames the ring already holds is the shape of
+        // the sender-side fault this guard exists for: a second timeline
+        // claiming slots the first one filled.
+        var samples = source.samples(index: 99)  // different audio…
+        let outcome = samples.withUnsafeMutableBufferPointer {
+            // …stamped for the frames packet 0 already occupies, with a
+            // sequence number the duplicate filter has not seen.
+            buffer.ingest(header: source.header(index: 0, seq: 9_000), samples: $0.baseAddress!)
+        }
+        XCTAssertEqual(outcome, .overlap)
+        XCTAssertEqual(buffer.counterSnapshot.overlap, 1)
+    }
+
+    func testAReorderedPacketStillFillsTheHoleLeftForIt() {
+        // The overlap guard must not break reordering: a hole is zero-filled,
+        // not audio, so the packet that turns up late still belongs in it.
+        let buffer = JitterBuffer(capacityFrames: 1 << 14)
+        var one = source
+        one.startNanos = 700_000_000_000
+        func put(_ index: Int, seq: UInt32) -> JitterBuffer.IngestOutcome {
+            var samples = one.samples(index: index)
+            return samples.withUnsafeMutableBufferPointer {
+                buffer.ingest(header: one.header(index: index, seq: seq), samples: $0.baseAddress!)
+            }
+        }
+        XCTAssertEqual(put(0, seq: 0), .restarted(index: 0))
+        XCTAssertEqual(put(3, seq: 3), .accepted(index: 3 * 240))
+        XCTAssertEqual(put(1, seq: 1), .reordered(index: 240))
+        XCTAssertEqual(put(2, seq: 2), .reordered(index: 2 * 240))
+        XCTAssertEqual(buffer.counterSnapshot.overlap, 0)
     }
 
     func testDecodedAudioMatchesTheSourceSamples() {

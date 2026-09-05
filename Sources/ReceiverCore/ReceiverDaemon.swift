@@ -96,6 +96,8 @@ public final class ReceiverDaemon: @unchecked Sendable {
     private var lastTargetClampLogNanos: UInt64?
     /// Sequence number of the last re-anchor already written to the log.
     private var loggedReanchorSequence: Int = 0
+    private var loggedOverlapTotal: Int = 0
+    private var loggedFarFutureTotal: Int = 0
     private var loggedReanchorTotal: Int = 0
     private var lastControlPort: UInt16 = 0
     private var statusWriteFailureLogged = false
@@ -479,7 +481,9 @@ public final class ReceiverDaemon: @unchecked Sendable {
                                    reanchorError: snapshot.reanchorsByReason[.error] ?? 0,
                                    p95JitterMs: snapshot.p95JitterMilliseconds
                                        .map { ($0 * 100).rounded() / 100 },
-                                   targetMs: (engine.targetLatencyMilliseconds * 10).rounded() / 10)
+                                   targetMs: (engine.targetLatencyMilliseconds * 10).rounded() / 10,
+                                   overlap: snapshot.counters.overlap,
+                                   farFuture: snapshot.counters.farFuture)
         controlServer?.send(.stats(message))
         let jitter = message.p95JitterMs.map { String(format: "%.1fms", $0) } ?? "-"
         let line = "late=\(message.late) lost=\(message.lost) underrun=\(message.underrun) "
@@ -488,10 +492,34 @@ public final class ReceiverDaemon: @unchecked Sendable {
             + "clip=\(message.clip) reanchor=\(snapshot.reanchors)"
             + "(starved=\(message.reanchorStarved) error=\(message.reanchorError)) "
             + "p95jitter=\(jitter) target=\(String(format: "%.0f", message.targetMs))ms"
+            + (snapshot.isIdle ? " idle" : "")
         lastStatsLine = line
         log.debug("stats \(line)")
+        logRefusedIfNew(snapshot)
         logReanchorIfNew(snapshot)
         publishStatus()
+    }
+
+    /// One WARN line when the sender starts sending packets this receiver
+    /// has to refuse, rate-limited to the 1 Hz stats tick.
+    ///
+    /// Both faults are the SENDER's: overlapping timestamps mean it is
+    /// running two timelines at once, and a play time seconds in the future
+    /// means its clock model has come loose. Neither is a link condition, so
+    /// neither should be buried at debug level with the jitter numbers.
+    private func logRefusedIfNew(_ snapshot: PlayoutEngine.Snapshot) {
+        let overlap = snapshot.counters.overlap
+        let farFuture = snapshot.counters.farFuture
+        defer {
+            loggedOverlapTotal = overlap
+            loggedFarFutureTotal = farFuture
+        }
+        let newOverlap = max(0, overlap - loggedOverlapTotal)
+        let newFarFuture = max(0, farFuture - loggedFarFutureTotal)
+        guard newOverlap > 0 || newFarFuture > 0 else { return }
+        log.warn("refused \(newOverlap) overlapping and \(newFarFuture) far-future "
+                 + "packet(s) in the last second (totals \(overlap)/\(farFuture)); "
+                 + "the sender is stamping more than one timeline")
     }
 
     /// One INFO line per re-anchor, at most one per stats tick.

@@ -32,6 +32,13 @@ public final class PlayoutEngine: @unchecked Sendable {
         public var p95JitterMilliseconds: Double?
         public var ratio: Double
         public var isPlaying: Bool
+        /// Render blocks rendered as silence because the link was idle. Not
+        /// underruns: nothing was owed and nothing was missed.
+        public var idleBlocks: Int
+        /// Times the stream started again after an idle stretch.
+        public var idleResumes: Int
+        /// Whether the link is idle as of this snapshot.
+        public var isIdle: Bool
     }
 
     /// One hard re-anchor, with the numbers that explain it.
@@ -74,6 +81,21 @@ public final class PlayoutEngine: @unchecked Sendable {
     private let anchoredBox = AtomicBool(false)
     /// The target moved under a running stream, so the level has to jump.
     private let targetMovedBox = AtomicBool(false)
+    /// Local monotonic ns of the most recent ingest, or 0 before the first.
+    /// Written on the UDP thread, read on the render thread.
+    private let lastIngestNanosBox = AtomicInt64(0)
+    private let idleResumeBox = AtomicInt64(0)
+    private let idleBlockBox = AtomicInt64(0)
+    private let idleBox = AtomicBool(false)
+
+    /// How long the link may go without a packet before the receiver treats
+    /// it as deliberate silence rather than as starvation.
+    ///
+    /// Comfortably longer than any delivery stall this link survives (a Wi-Fi
+    /// aggregation gap is tens of milliseconds) and shorter than a listener
+    /// would notice, so a paused programme costs no underruns, no splice and
+    /// no log noise.
+    public static let idleThresholdNanos: UInt64 = 500_000_000
 
     // The last re-anchor, published field by field because the render thread
     // may not allocate. `lastReanchorSequence` is written LAST, so a reader
@@ -221,17 +243,23 @@ public final class PlayoutEngine: @unchecked Sendable {
     public func startStream() {
         anchoredBox.value = false
         playingBox.value = true
+        idleBox.value = false
+        lastIngestNanosBox.value = 0
     }
 
     /// Stop and mute: no more audio leaves the DAC until a new stream starts.
     public func stopStream() {
         playingBox.value = false
         anchoredBox.value = false
+        idleBox.value = false
+        lastIngestNanosBox.value = 0
         buffer.resetStream()
     }
 
     public func resetCounters() {
         buffer.resetCounters()
+        idleBlockBox.value = 0
+        idleResumeBox.value = 0
         clipBox.value = 0
         reanchorBox.value = 0
         reanchorStarvedBox.value = 0
@@ -254,7 +282,10 @@ public final class PlayoutEngine: @unchecked Sendable {
                  fillMilliseconds: buffer.fillMilliseconds,
                  p95JitterMilliseconds: arrivalTracker.p95SpreadMilliseconds,
                  ratio: ratioPublished.value,
-                 isPlaying: playingBox.value)
+                 isPlaying: playingBox.value,
+                 idleBlocks: Int(idleBlockBox.value),
+                 idleResumes: Int(idleResumeBox.value),
+                 isIdle: idleBox.value)
     }
 
     /// The most recent hard re-anchor, or nil if there has not been one.
@@ -299,13 +330,33 @@ public final class PlayoutEngine: @unchecked Sendable {
     public func ingest(header: AudioPacketHeader,
                        samples: UnsafePointer<Int16>,
                        arrivalNanos: UInt64) -> JitterBuffer.IngestOutcome {
+        // A stretch with no packets at all is SILENCE, not a fault: the
+        // sender stops writing when the programme stops, and the correct
+        // rendering of that is zero-fill. But the schedule it left behind is
+        // stale by the time audio comes back, so the stream starts again from
+        // scratch rather than being measured against it — one silent
+        // re-anchor instead of a second of late/lost accounting followed by a
+        // splice.
+        let previousIngest = lastIngestNanosBox.value
+        if previousIngest > 0,
+           arrivalNanos > UInt64(previousIngest),
+           arrivalNanos - UInt64(previousIngest) >= Self.idleThresholdNanos {
+            buffer.resetStream()
+            arrivalTracker.reset()
+            anchoredBox.value = false
+            idleResumeBox.add(1)
+        }
+        lastIngestNanosBox.value = Int64(bitPattern: arrivalNanos)
+
         let outcome = buffer.ingest(header: header, samples: samples)
         switch outcome {
         case .accepted, .reordered, .restarted:
             arrivalTracker.record(playAtNanos: header.playAtNanos, arrivalNanos: arrivalNanos)
-        case .late, .duplicate:
-            // A duplicate says nothing new about the link, and a late packet's
-            // delay is already past the point the buffer could have used it.
+        case .late, .duplicate, .overlap, .farFuture:
+            // A duplicate says nothing new about the link, a late packet's
+            // delay is already past the point the buffer could have used it,
+            // and a refused packet says something about the SENDER rather
+            // than about this link's arrival timing.
             break
         }
         return outcome
@@ -327,6 +378,22 @@ public final class PlayoutEngine: @unchecked Sendable {
             silence(frames: frames, outputs: outputs)
             return
         }
+
+        // Idle: the sender has stopped, so there is nothing to be starved OF.
+        // Render silence, count it as silence rather than as an underrun, and
+        // leave the loop alone — a re-anchor storm on resume is what happens
+        // when a drained buffer is read as a fault. The cursor is dropped so
+        // the first render after the stream comes back anchors once, cleanly.
+        let lastIngest = lastIngestNanosBox.value
+        if lastIngest > 0, dacDeadlineNanos > UInt64(bitPattern: lastIngest),
+           dacDeadlineNanos - UInt64(bitPattern: lastIngest) >= Self.idleThresholdNanos {
+            idleBox.value = true
+            idleBlockBox.add(1)
+            anchoredBox.value = false
+            silence(frames: frames, outputs: outputs)
+            return
+        }
+        idleBox.value = false
 
         let targetFrames = levelSetpointFrames
         if !anchoredBox.value {
