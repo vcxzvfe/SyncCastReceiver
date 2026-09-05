@@ -1,0 +1,269 @@
+import Foundation
+
+/// Everything that happens between "a packet arrived" and "Float32 frames go
+/// to the DAC": the jitter ring, the clock-following PI loop, the fractional
+/// resampler and the software gain stage.
+///
+/// It is deliberately free of CoreAudio and of the network: the AUHAL render
+/// callback and `--selftest` drive exactly the same code, so the offline
+/// self-test exercises the real scheduler rather than a mock of it.
+///
+/// Threading: `ingest` runs on the UDP receive thread, `render` on the
+/// CoreAudio real-time thread, and the setters on the control-channel queue.
+/// Everything crossing those boundaries is atomic; `render` allocates
+/// nothing and takes no lock.
+public final class PlayoutEngine: @unchecked Sendable {
+
+    public struct Snapshot: Sendable {
+        public var counters: JitterBuffer.Counters
+        public var clip: Int
+        public var reanchors: Int
+        public var fillMilliseconds: Double
+        public var ratio: Double
+        public var isPlaying: Bool
+    }
+
+    public let buffer: JitterBuffer
+    public let sampleRate: Double
+    public let channelCount: Int
+
+    private let resampler: FractionalResampler
+    /// PI loop state lives on the render thread only; `ratioPublished` is the
+    /// copy the stats thread reads.
+    private var loop: ClockFollowLoop
+    private let ratioPublished = AtomicDouble(1.0)
+
+    private let offsetNanosBox = AtomicInt64(0)
+    private let offsetValid = AtomicBool(false)
+    private let targetFramesBox = AtomicInt64(0)
+    private let softwareGainBox = AtomicDouble(1.0)
+    private let mutedBox = AtomicBool(false)
+    private let clipBox = AtomicInt64(0)
+    private let reanchorBox = AtomicInt64(0)
+    private let playingBox = AtomicBool(false)
+    private let anchoredBox = AtomicBool(false)
+
+    /// Render-thread scratch. Sized for a very large AUHAL buffer (8192
+    /// frames is 170 ms at 48 kHz; no output device asks for more) plus the
+    /// resampler's slop.
+    private static let scratchCapacityFrames = 8_192 + 64
+    private let inputScratch: UnsafeMutablePointer<UnsafeMutablePointer<Float>>
+    private let stagingBuffer: UnsafeMutablePointer<UnsafeMutablePointer<Float>>
+    /// Per-call view of `stagingBuffer` offset by `stagingCount`, kept as a
+    /// preallocated array so the render thread never allocates.
+    private let stagingWriteHeads: UnsafeMutablePointer<UnsafeMutablePointer<Float>>
+    private var stagingCount = 0
+    private var smoothedGain: Float = 1.0
+
+    public init(channelCount: Int = WireFormat.channelCount,
+                sampleRate: Double = WireFormat.sampleRate,
+                capacityFrames: Int = 1 << 16,
+                tuning: ClockFollowLoop.Tuning = ClockFollowLoop.Tuning()) {
+        self.channelCount = channelCount
+        self.sampleRate = sampleRate
+        self.buffer = JitterBuffer(channelCount: channelCount,
+                                   capacityFrames: capacityFrames,
+                                   sampleRate: sampleRate)
+        self.resampler = FractionalResampler(channelCount: channelCount)
+        self.loop = ClockFollowLoop(tuning: tuning)
+        func alloc() -> UnsafeMutablePointer<UnsafeMutablePointer<Float>> {
+            let table = UnsafeMutablePointer<UnsafeMutablePointer<Float>>.allocate(capacity: channelCount)
+            for ch in 0..<channelCount {
+                let p = UnsafeMutablePointer<Float>.allocate(capacity: Self.scratchCapacityFrames)
+                p.initialize(repeating: 0, count: Self.scratchCapacityFrames)
+                table[ch] = p
+            }
+            return table
+        }
+        self.inputScratch = alloc()
+        self.stagingBuffer = alloc()
+        self.stagingWriteHeads =
+            UnsafeMutablePointer<UnsafeMutablePointer<Float>>.allocate(capacity: channelCount)
+        for ch in 0..<channelCount { self.stagingWriteHeads[ch] = self.stagingBuffer[ch] }
+        self.targetFramesBox.value = Int64(0.090 * sampleRate)   // spec default 90 ms
+    }
+
+    deinit {
+        for ch in 0..<channelCount {
+            inputScratch[ch].deinitialize(count: Self.scratchCapacityFrames)
+            inputScratch[ch].deallocate()
+            stagingBuffer[ch].deinitialize(count: Self.scratchCapacityFrames)
+            stagingBuffer[ch].deallocate()
+        }
+        inputScratch.deallocate()
+        stagingBuffer.deallocate()
+        stagingWriteHeads.deallocate()
+    }
+
+    // MARK: - Control-thread setters
+
+    /// `local = sender + offset`, from the NTP estimator.
+    public func setClockOffset(nanos: Int64) {
+        offsetNanosBox.value = nanos
+        offsetValid.value = true
+    }
+
+    public func clearClockOffset() {
+        offsetValid.value = false
+        anchoredBox.value = false
+    }
+
+    public func setTargetLatency(milliseconds: Double) {
+        let clamped = min(max(milliseconds, 10), 1_000)
+        targetFramesBox.value = Int64(clamped / 1000 * sampleRate)
+    }
+
+    public var targetLatencyMilliseconds: Double {
+        Double(targetFramesBox.value) / sampleRate * 1000
+    }
+
+    /// Linear amplitude applied in the render path. Left at 1.0 when the
+    /// device carries the level in hardware.
+    public func setSoftwareGain(_ gain: Double) {
+        softwareGainBox.value = min(max(gain, 0), 4)
+    }
+
+    public func setMuted(_ muted: Bool) { mutedBox.value = muted }
+
+    /// Arm playback. The next render anchors the cursor from the clock.
+    public func startStream() {
+        anchoredBox.value = false
+        playingBox.value = true
+    }
+
+    /// Stop and mute: no more audio leaves the DAC until a new stream starts.
+    public func stopStream() {
+        playingBox.value = false
+        anchoredBox.value = false
+        buffer.resetStream()
+    }
+
+    public func resetCounters() {
+        buffer.resetCounters()
+        clipBox.value = 0
+        reanchorBox.value = 0
+    }
+
+    public var snapshot: Snapshot {
+        Snapshot(counters: buffer.counterSnapshot,
+                 clip: Int(clipBox.value),
+                 reanchors: Int(reanchorBox.value),
+                 fillMilliseconds: buffer.fillMilliseconds,
+                 ratio: ratioPublished.value,
+                 isPlaying: playingBox.value)
+    }
+
+    // MARK: - UDP thread
+
+    @discardableResult
+    public func ingest(header: AudioPacketHeader, samples: UnsafePointer<Int16>) -> JitterBuffer.IngestOutcome {
+        buffer.ingest(header: header, samples: samples)
+    }
+
+    // MARK: - Render thread
+
+    /// Fill `outputs` with `frames` of planar Float32.
+    ///
+    /// - Parameter dacDeadlineNanos: local monotonic ns at which the FIRST
+    ///   frame of this block leaves the DAC — i.e. the AUHAL timestamp plus
+    ///   the device's own output latency.
+    public func render(frames: Int,
+                       dacDeadlineNanos: UInt64,
+                       outputs: UnsafePointer<UnsafeMutablePointer<Float>>) {
+        guard frames > 0 else { return }
+        guard frames <= Self.scratchCapacityFrames else { silence(frames: frames, outputs: outputs); return }
+        guard playingBox.value, offsetValid.value, buffer.isAnchored else {
+            silence(frames: frames, outputs: outputs)
+            return
+        }
+
+        let targetFrames = targetFramesBox.value
+        if !anchoredBox.value {
+            // Map the DAC deadline into the sender's clock and start playing
+            // exactly the frame that was stamped for it.
+            let senderNanos = UInt64(bitPattern: Int64(bitPattern: dacDeadlineNanos) &- offsetNanosBox.value)
+            buffer.anchorReadCursor(toSenderNanos: senderNanos)
+            resampler.reset()
+            loop.reset(fillFrames: Double(buffer.fillFrames))
+            stagingCount = 0
+            anchoredBox.value = true
+        }
+
+        let dt = Double(frames) / sampleRate
+        let outcome = loop.update(fillFrames: Double(buffer.fillFrames),
+                                  targetFrames: Double(targetFrames),
+                                  dt: dt)
+        if outcome == .reanchorNeeded {
+            buffer.reanchorReadCursor(toLevelFrames: targetFrames)
+            resampler.reset()
+            loop.reset(fillFrames: Double(targetFrames))
+            stagingCount = 0
+            reanchorBox.add(1)
+        }
+        let ratio = loop.ratio
+        ratioPublished.value = ratio
+
+        var guardCounter = 0
+        while stagingCount < frames && guardCounter < 8 {
+            guardCounter += 1
+            let missing = frames - stagingCount
+            var need = resampler.inputFramesNeeded(forOutput: missing, ratio: ratio)
+            need = min(need, Self.scratchCapacityFrames)
+            buffer.read(frames: need, into: UnsafePointer(inputScratch))
+            for ch in 0..<channelCount {
+                stagingWriteHeads[ch] = stagingBuffer[ch].advanced(by: stagingCount)
+            }
+            let produced = resampler.process(
+                inputs: UnsafePointer(inputScratch),
+                inFrames: need,
+                ratio: ratio,
+                outputs: UnsafePointer(stagingWriteHeads),
+                outCapacity: Self.scratchCapacityFrames - stagingCount)
+            if produced == 0 { break }
+            stagingCount += produced
+        }
+        if stagingCount < frames {
+            for ch in 0..<channelCount {
+                stagingBuffer[ch].advanced(by: stagingCount)
+                    .update(repeating: 0, count: frames - stagingCount)
+            }
+            stagingCount = frames
+        }
+        emit(frames: frames, from: UnsafePointer(stagingBuffer), to: outputs)
+        let remainder = stagingCount - frames
+        if remainder > 0 {
+            for ch in 0..<channelCount {
+                stagingBuffer[ch].update(from: stagingBuffer[ch].advanced(by: frames), count: remainder)
+            }
+        }
+        stagingCount = remainder
+    }
+
+    private func emit(frames: Int,
+                      from staging: UnsafePointer<UnsafeMutablePointer<Float>>,
+                      to outputs: UnsafePointer<UnsafeMutablePointer<Float>>) {
+        let target: Float = mutedBox.value ? 0 : Float(softwareGainBox.value)
+        let start = smoothedGain
+        // One-block linear ramp: a step in the master would otherwise click.
+        let stepGain = (target - start) / Float(frames)
+        var clips: Int64 = 0
+        for ch in 0..<channelCount {
+            var g = start
+            let src = staging[ch]
+            let dst = outputs[ch]
+            for f in 0..<frames {
+                var v = src[f] * g
+                if v > 1.0 { v = 1.0; clips += 1 } else if v < -1.0 { v = -1.0; clips += 1 }
+                dst[f] = v
+                g += stepGain
+            }
+        }
+        smoothedGain = target
+        if clips > 0 { clipBox.add(clips) }
+    }
+
+    private func silence(frames: Int, outputs: UnsafePointer<UnsafeMutablePointer<Float>>) {
+        for ch in 0..<channelCount { outputs[ch].update(repeating: 0, count: frames) }
+        smoothedGain = mutedBox.value ? 0 : Float(softwareGainBox.value)
+    }
+}
