@@ -30,6 +30,8 @@ public final class ReceiverDaemon: @unchecked Sendable {
         static let statsIntervalSeconds: Double = 1
         static let deviceRetrySeconds: Double = 2
         static let listenerRetrySeconds: Double = 2
+        /// How often the "still no output device" warning may repeat.
+        static let deviceWarningIntervalSeconds: Double = 60
     }
 
     private let options: Options
@@ -52,6 +54,8 @@ public final class ReceiverDaemon: @unchecked Sendable {
     private var connectedPeer: String?
     private var streaming = false
     private var lastPathSatisfied = true
+    private var appliedHardwareMute = false
+    private var lastDeviceWarningNanos: UInt64?
 
     private var statsTimer: DispatchSourceTimer?
     private var maintenanceTimer: DispatchSourceTimer?
@@ -141,6 +145,7 @@ public final class ReceiverDaemon: @unchecked Sendable {
             try newOutput.start()
             device = resolved
             output = newOutput
+            lastDeviceWarningNanos = nil
             volume = HardwareVolumeControl(deviceID: resolved.id)
             log.info("output device \"\(resolved.name)\" [\(resolved.uid)] "
                      + "rate \(Int(resolved.nominalSampleRate)) Hz, "
@@ -148,7 +153,17 @@ public final class ReceiverDaemon: @unchecked Sendable {
                      + "hardware volume \(volume?.hasVolume == true ? "yes" : "no")")
             return true
         } catch {
-            log.warn("output device unavailable (\(error)); retrying every \(Int(Constants.deviceRetrySeconds)) s")
+            // The retry runs every two seconds forever; saying so every two
+            // seconds would be the only thing in the log.
+            let now = clock.nowNanos()
+            let quiet = lastDeviceWarningNanos.map {
+                Double(now &- $0) / 1_000_000_000 < Constants.deviceWarningIntervalSeconds
+            } ?? false
+            if !quiet {
+                lastDeviceWarningNanos = now
+                log.warn("output device unavailable (\(error)); retrying every "
+                         + "\(Int(Constants.deviceRetrySeconds)) s")
+            }
             return false
         }
     }
@@ -314,6 +329,7 @@ public final class ReceiverDaemon: @unchecked Sendable {
             engine.setSoftwareGain(1.0)
             if volume.hasMute {
                 volume.setMuted(muted)
+                appliedHardwareMute = muted
                 engine.setMuted(false)
             } else {
                 engine.setMuted(muted)
@@ -329,6 +345,16 @@ public final class ReceiverDaemon: @unchecked Sendable {
         streaming = false
         engine.setMuted(true)
         engine.stopStream()
+        // The LEVEL stays where the sender put it — that is the level the
+        // listener is hearing everything else at. Hardware MUTE is different:
+        // it is a switch on a device the local user shares, and leaving it
+        // engaged after we stopped would look like broken hardware. We are
+        // already silent because the stream is stopped.
+        if appliedHardwareMute, let volume, volume.hasMute {
+            volume.setMuted(false)
+            appliedHardwareMute = false
+            log.info("released the device's hardware mute (the volume level is left as the sender set it)")
+        }
         engine.clearClockOffset()
         audioSocket.setExpectedStreamID(nil)
         lastPingNanos = nil

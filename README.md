@@ -140,7 +140,10 @@ you which side of the line you are on: `underrun` must stay 0.
 * `SIGTERM` (what `launchctl bootout` sends) stops the audio unit cleanly.
   **The hardware volume is deliberately left where the sender set it** — the
   level belongs to the speaker the listener is using, and snapping it back on
-  every restart would fight the sender's own state.
+  every restart would fight the sender's own state. Hardware *mute* is the one
+  exception: if the sender muted the device and then went away, the daemon
+  releases the mute when it stops, because a shared output stuck on mute looks
+  like broken hardware and playback has already stopped anyway.
 
 ## Volume
 
