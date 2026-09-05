@@ -132,14 +132,23 @@ substring of the name shown in System Settings → Sound.
 .build/release/synccast-receiver --selftest
 ```
 
-Synthesises 70 s of a stream — with injected loss, duplication and reordering,
-and a device clock 100 ppm fast — and runs it through the **real** packet
-parser, jitter buffer, clock loop and resampler with no network and no audio
-hardware. It checks the loss/duplicate/late accounting, that there are no
-underruns or clipping, that the buffer sits at its setpoint, that the trim
-stays inside ±200 ppm and converges on the clock error, that the output level
-is right, and that playout lands within a millisecond of `play_at_ns`. It
-prints `SELFTEST PASS` and exits 0 when everything holds. It takes a few
+Runs two simulated links through the **real** packet parser, jitter buffer,
+clock loop and resampler, with no network and no audio hardware.
+
+1. **Steady** — 70 s of a wired-LAN-shaped stream (one packet every 5 ms) with
+   injected loss, duplication and reordering, and a device clock 100 ppm fast.
+   It checks the loss/duplicate/late accounting, that there are no underruns
+   or clipping, that the buffer sits at its setpoint, that the trim stays
+   inside ±200 ppm and converges on the clock error, that the output level is
+   right, and that playout lands within a millisecond of `play_at_ns`.
+2. **Bursty** — 90 s of a Wi-Fi-shaped stream: packets delivered in bursts of
+   six every 30 ms, plus a delivery stall of 80 ms about once a second. The
+   contract is **zero hard re-anchors** after warm-up, with underruns budgeted
+   against the stalls that were injected. Burst delivery empties the ring for
+   a block at the end of most gaps; a receiver that treats that as starvation
+   splices — and clicks — several times a second.
+
+It prints `SELFTEST PASS` and exits 0 when everything holds. It takes a few
 seconds of CPU and works on a machine with no audio devices at all.
 
 ## Checking on a running daemon
@@ -165,15 +174,36 @@ Logs go to `~/Library/Logs/SyncCastReceiver/receiver.log` (rotated at 5 MB
 into `receiver.log.1`), and to the terminal as well when stderr is a TTY. Once
 a second, while a stream is running, the daemon logs and sends the sender a
 `stats` line: late, lost, underrun and clip counts, the buffer level in
-milliseconds, and the current trim.
+milliseconds, the current trim, the number of hard re-anchors split by cause
+(`reanchor_starved` / `reanchor_error`), the link's measured p95 arrival
+jitter, and the target it is actually running at.
+
+Every hard re-anchor also gets its own INFO line saying why it happened and
+with what numbers (level error, ring fill, consecutive starved blocks), rate
+limited to one per second. A re-anchor is an audible splice, so if the audio
+clicks, that line says which of the two faults caused it.
 
 ## Latency
 
 `target_ms` comes from the sender (default 90 ms, useful range 30–300). What
 you get end to end is roughly `target_ms` plus the sender's own capture and
 ring latency. Below about 60 ms on Wi-Fi the buffer starts to run out during
-ordinary interference; a wired LAN is comfortable at 40 ms. The counters tell
-you which side of the line you are on: `underrun` must stay 0.
+ordinary interference; a wired LAN is comfortable at 40 ms.
+
+The receiver treats that number as a FLOOR it may raise, never a ceiling. It
+measures how spread out packet arrivals actually are on this link (p95 minus
+the best packet in the last few seconds, reported as `p95_jitter_ms`) and
+raises the target to at least that plus two render blocks, capped at 300 ms.
+A target below the spread cannot work — the buffer would be asked to hold
+less audio than the network routinely withholds — so it is better to add the
+latency than to click. The value in use is what `hello_ack.buffer_ms` and
+`stats.target_ms` report, and a line in the log says when and why it was
+raised.
+
+The counters tell you which side of the line you are on. `underrun` counts
+render blocks that ran dry: some are unavoidable on a link that stalls, and
+they cost a few milliseconds of silence each. `reanchor_*` is the one to
+watch — a re-anchor is a splice, and a healthy link has none.
 
 ## Behaviour under load, sleep and faults
 
