@@ -33,6 +33,19 @@ final class CLIOptionsTests: XCTestCase {
         XCTAssertEqual(try CLIOptions.parse(["--print-token"]).action, .printToken)
         XCTAssertEqual(try CLIOptions.parse(["--uninstall"]).action, .uninstall)
         XCTAssertEqual(try CLIOptions.parse(["-h"]).action, .help)
+        XCTAssertEqual(try CLIOptions.parse(["--doctor"]).action, .doctor)
+        XCTAssertEqual(try CLIOptions.parse(["--status"]).action, .status)
+    }
+
+    /// Both new verbs are diagnostics that must be reachable from a help
+    /// text, and both conflict with everything else.
+    func testTheNewDiagnosticVerbsAreDocumentedAndExclusive() {
+        XCTAssertTrue(CLIOptions.usage.contains("--doctor"), CLIOptions.usage)
+        XCTAssertTrue(CLIOptions.usage.contains("--status"), CLIOptions.usage)
+        XCTAssertTrue(CLIOptions.usage.contains("Application Firewall"), CLIOptions.usage)
+        XCTAssertThrowsError(try CLIOptions.parse(["--doctor", "--status"])) {
+            XCTAssertEqual($0 as? CLIOptions.ParseError, .conflictingActions)
+        }
     }
 
     func testErrors() {

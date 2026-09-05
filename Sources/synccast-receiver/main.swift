@@ -43,6 +43,30 @@ case .printToken:
         exit(1)
     }
 
+case .doctor:
+    // Read-only, and deliberately usable before the daemon is installed: the
+    // firewall question is the first thing to ask when the sender connects
+    // and then hears nothing back.
+    let executable = LaunchAgentInstaller.resolvedExecutablePath(argv0: CommandLine.arguments[0])
+    for line in FirewallCheck.advice(for: FirewallCheck.inspect(binaryPath: executable)) {
+        print(line)
+    }
+    exit(0)
+
+case .status:
+    do {
+        let status = try StatusFile(paths: paths).read()
+        for line in StatusFile.render(status,
+                                      now: Date().timeIntervalSince1970,
+                                      processIsAlive: StatusFile.processIsAlive(status.pid)) {
+            print(line)
+        }
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data("synccast-receiver: \(error)\n".utf8))
+        exit(1)
+    }
+
 case .install:
     do {
         let executable = LaunchAgentInstaller.resolvedExecutablePath(argv0: CommandLine.arguments[0])
@@ -54,6 +78,13 @@ case .install:
         }
         print("pairing token: \(config.token)")
         print("enter that token in SyncCast once, for the receiver named \"\(config.name)\".")
+        // The install is not finished until the firewall will actually let
+        // the daemon be reached. Printed last so it is the thing still on
+        // screen when the install returns.
+        print("")
+        for line in FirewallCheck.advice(for: FirewallCheck.inspect(binaryPath: executable)) {
+            print(line)
+        }
         exit(0)
     } catch {
         FileHandle.standardError.write(Data("synccast-receiver: install failed: \(error)\n".utf8))

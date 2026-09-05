@@ -32,6 +32,9 @@ public final class ReceiverDaemon: @unchecked Sendable {
         static let listenerRetrySeconds: Double = 2
         /// How often the "still no output device" warning may repeat.
         static let deviceWarningIntervalSeconds: Double = 60
+        /// How often the "something else changed the level" line may repeat
+        /// while the same fight is still going on.
+        static let externalChangeLogIntervalSeconds: Double = 5
     }
 
     private let options: Options
@@ -60,10 +63,32 @@ public final class ReceiverDaemon: @unchecked Sendable {
     private var statsTimer: DispatchSourceTimer?
     private var maintenanceTimer: DispatchSourceTimer?
 
-    public init(options: Options, config: ReceiverConfig, log: Log) {
+    // Level re-assertion. `desired*` is what the sender last asked for on the
+    // hardware path; `volumeSuppressedUntilNanos` is the window in which a
+    // reported change is our own write coming back.
+    private var volumeObserver: DeviceVolumeObserver?
+    private var desiredScalar: Float?
+    private var desiredMuted = false
+    private var volumeSuppressedUntilNanos: UInt64?
+    private var volumeSweepScheduled = false
+    private var volumeVerifyScheduled = false
+    /// When the "something else changed the level" line was last written.
+    /// nil once a sweep finds the device where we want it, so a NEW external
+    /// change is always reported.
+    private var lastExternalChangeLogNanos: UInt64?
+
+    private let statusFile: StatusFile
+    private let startedAtEpoch = Date().timeIntervalSince1970
+    private var lastStatsLine: String?
+    private var lastControlPort: UInt16 = 0
+    private var statusWriteFailureLogged = false
+
+    public init(options: Options, config: ReceiverConfig, log: Log,
+                statusFile: StatusFile? = nil) {
         self.options = options
         self.config = config
         self.log = log
+        self.statusFile = statusFile ?? StatusFile()
         self.engine = PlayoutEngine()
         self.engine.setTargetLatency(milliseconds: options.defaultTargetMilliseconds)
         self.audioSocket = AudioSocket(engine: engine) { [weak self] message in
@@ -82,6 +107,7 @@ public final class ReceiverDaemon: @unchecked Sendable {
             self.startListener()
             self.startTimers()
             self.startPathMonitor()
+            self.publishStatus()
         }
     }
 
@@ -96,10 +122,15 @@ public final class ReceiverDaemon: @unchecked Sendable {
             maintenanceTimer?.cancel(); maintenanceTimer = nil
             pathMonitor?.cancel(); pathMonitor = nil
             controlServer?.stop(); controlServer = nil
+            volumeObserver?.stop(); volumeObserver = nil
             audioSocket.close()
             engine.stopStream()
             output?.stop()
             output = nil
+            // Removed rather than left behind: a stale file that says
+            // "streaming" would send the next `--status` reader down the
+            // wrong path entirely.
+            statusFile.remove()
         }
         log.flush()
     }
@@ -139,6 +170,10 @@ public final class ReceiverDaemon: @unchecked Sendable {
         if let output, output.isRunning, let device, AudioDevices.isAlive(device.id) { return true }
         output?.stop()
         output = nil
+        // The listeners belong to the OLD device id; keeping them would leave
+        // us re-asserting a level on a device nobody is listening to.
+        volumeObserver?.stop()
+        volumeObserver = nil
         do {
             let resolved = try AudioDevices.resolve(query: options.deviceQuery)
             let newOutput = AUHALOutput(device: resolved, engine: engine)
@@ -221,7 +256,9 @@ public final class ReceiverDaemon: @unchecked Sendable {
     private func handle(_ event: ControlServer.Event) {
         switch event {
         case .listening(let port):
+            lastControlPort = port
             log.info("control channel listening on TCP port \(port), advertising \(WireFormat.bonjourServiceType)")
+            publishStatus()
         case .connected(let peer):
             log.info("sender connected from \(peer)")
         case .rejected(let peer, let reason):
@@ -232,6 +269,7 @@ public final class ReceiverDaemon: @unchecked Sendable {
             connectedPeer = nil
             audioSocket.setExpectedPeer(nil)
             audioSocket.setExpectedStreamID(nil)
+            publishStatus()
         case .failed(let message):
             restartListener(reason: message)
         case .message(let message, let peer):
@@ -299,6 +337,8 @@ public final class ReceiverDaemon: @unchecked Sendable {
         log.info("stream \(hello.streamID) from \"\(hello.name)\" at \(peer): "
                  + "udp \(audioSocket.boundPort), target \(ack.bufferMs) ms, "
                  + "device latency \(String(format: "%.1f", output.outputLatencyMilliseconds)) ms")
+        startVolumeObserverIfNeeded()
+        publishStatus()
     }
 
     private func handlePing(_ ping: PingMessage) {
@@ -324,25 +364,48 @@ public final class ReceiverDaemon: @unchecked Sendable {
             guard let volume, let scalar = plan.hardwareScalar else { return }
             // Ask the driver for the conversion when it offers one.
             let deviceScalar = volume.scalar(forAmplitude: Float(min(max(linear, 0), 1)))
-            let status = volume.setScalar(deviceScalar.isFinite ? deviceScalar : scalar)
-            if status != noErr { log.warn("hardware volume write failed with OSStatus \(status)") }
+            let wanted = deviceScalar.isFinite ? deviceScalar : scalar
+            desiredScalar = wanted
+            desiredMuted = volume.hasMute ? muted : false
+            writeHardwareLevel(volume: volume, scalar: wanted, muted: muted)
             engine.setSoftwareGain(1.0)
-            if volume.hasMute {
-                volume.setMuted(muted)
-                appliedHardwareMute = muted
-                engine.setMuted(false)
-            } else {
-                engine.setMuted(muted)
-            }
+            engine.setMuted(volume.hasMute ? false : muted)
+            startVolumeObserverIfNeeded()
         case .software:
+            // Nothing external can move a software gain, so there is nothing
+            // to watch and nothing to re-assert.
+            desiredScalar = nil
+            desiredMuted = false
             engine.setSoftwareGain(Double(plan.softwareAmplitude ?? 0))
             engine.setMuted(muted)
         }
     }
 
+    /// The one place that writes the device's level, so the suppression
+    /// window is opened on every write and cannot be forgotten at a call
+    /// site.
+    private func writeHardwareLevel(volume: HardwareVolumeControl, scalar: Float, muted: Bool) {
+        volumeSuppressedUntilNanos = VolumeReassertionPolicy.suppressionDeadline(
+            nowNanos: clock.nowNanos())
+        let status = volume.setScalar(scalar)
+        if status != noErr { log.warn("hardware volume write failed with OSStatus \(status)") }
+        if volume.hasMute {
+            volume.setMuted(muted)
+            appliedHardwareMute = muted
+        }
+        scheduleVolumeVerification()
+    }
+
     private func stopStreaming(reason: String) {
         guard streaming else { return }
         streaming = false
+        // Stop defending a level nobody is driving any more: with no sender,
+        // the device belongs entirely to whoever else is using this Mac.
+        volumeObserver?.stop()
+        volumeObserver = nil
+        desiredScalar = nil
+        volumeSuppressedUntilNanos = nil
+        lastExternalChangeLogNanos = nil
         engine.setMuted(true)
         engine.stopStream()
         // The LEVEL stays where the sender put it — that is the level the
@@ -360,6 +423,7 @@ public final class ReceiverDaemon: @unchecked Sendable {
         lastPingNanos = nil
         pendingExchange = nil
         log.info("playback stopped (\(reason))")
+        publishStatus()
     }
 
     private func emitStats() {
@@ -372,9 +436,133 @@ public final class ReceiverDaemon: @unchecked Sendable {
                                    ratio: (snapshot.ratio * 1e9).rounded() / 1e9,
                                    clip: snapshot.clip)
         controlServer?.send(.stats(message))
-        log.debug("stats late=\(message.late) lost=\(message.lost) underrun=\(message.underrun) "
-                  + "buffer=\(String(format: "%.1f", message.bufferMs))ms "
-                  + "trim=\(String(format: "%+.1f", (message.ratio - 1) * 1e6))ppm "
-                  + "clip=\(message.clip) reanchor=\(snapshot.reanchors)")
+        let line = "late=\(message.late) lost=\(message.lost) underrun=\(message.underrun) "
+            + "buffer=\(String(format: "%.1f", message.bufferMs))ms "
+            + "trim=\(String(format: "%+.1f", (message.ratio - 1) * 1e6))ppm "
+            + "clip=\(message.clip) reanchor=\(snapshot.reanchors)"
+        lastStatsLine = line
+        log.debug("stats \(line)")
+        publishStatus()
+    }
+
+    // MARK: - level re-assertion
+
+    /// Watch the device's level whenever the sender's master is being carried
+    /// in hardware. Only then: on the software path nothing outside this
+    /// process can change the gain, so there is nothing to defend.
+    private func startVolumeObserverIfNeeded() {
+        guard streaming, desiredScalar != nil, let device, let volume, volume.hasVolume else { return }
+        if let existing = volumeObserver, existing.deviceID == device.id { return }
+        volumeObserver?.stop()
+        let observer = DeviceVolumeObserver(deviceID: device.id, queue: queue) { [weak self] _ in
+            self?.scheduleVolumeSweep()
+        }
+        observer.start()
+        guard observer.isObserving else {
+            volumeObserver = nil
+            return
+        }
+        volumeObserver = observer
+        log.info("watching the output device's volume and mute; the sender's level "
+                 + "will be re-applied if something else changes it")
+    }
+
+    /// Coalesce a burst of property notifications (a slider drag is many)
+    /// into one comparison, and act on it fast — the whole path from an
+    /// external change to the level being back where the sender put it stays
+    /// inside about 200 ms.
+    private func scheduleVolumeSweep() {
+        guard !volumeSweepScheduled else { return }
+        volumeSweepScheduled = true
+        queue.asyncAfter(
+            deadline: .now() + .nanoseconds(Int(VolumeReassertionPolicy.coalesceDelayNanos))
+        ) { [weak self] in
+            self?.volumeSweepScheduled = false
+            self?.reassertLevelIfChanged()
+        }
+    }
+
+    /// The safety net after our OWN write: an external change that lands
+    /// inside the suppression window is (correctly) ignored at the time and
+    /// produces no further notification, so without a sweep just past the
+    /// window's end it would stick.
+    private func scheduleVolumeVerification() {
+        guard !volumeVerifyScheduled else { return }
+        volumeVerifyScheduled = true
+        queue.asyncAfter(
+            deadline: .now() + .nanoseconds(Int(VolumeReassertionPolicy.verifyDelayNanos))
+        ) { [weak self] in
+            self?.volumeVerifyScheduled = false
+            self?.reassertLevelIfChanged()
+        }
+    }
+
+    private func reassertLevelIfChanged() {
+        guard streaming, let volume, let desired = desiredScalar else { return }
+        let now = clock.nowNanos()
+        let observedScalar = volume.currentScalar() ?? .nan
+        let scalarDecision = VolumeReassertionPolicy.decideScalar(
+            observed: observedScalar,
+            desired: desired,
+            nowNanos: now,
+            suppressedUntilNanos: volumeSuppressedUntilNanos)
+        var muteDecision = VolumeReassertionDecision.matches
+        if volume.hasMute, let observedMute = volume.currentMuted() {
+            muteDecision = VolumeReassertionPolicy.decideMute(
+                observed: observedMute,
+                desired: desiredMuted,
+                nowNanos: now,
+                suppressedUntilNanos: volumeSuppressedUntilNanos)
+        }
+        guard scalarDecision == .reassert || muteDecision == .reassert else {
+            // Back where it should be: the next external change is a new
+            // event and gets its own line.
+            if scalarDecision == .matches && muteDecision == .matches {
+                lastExternalChangeLogNanos = nil
+            }
+            return
+        }
+        // One line per external change, not per write. Something that keeps
+        // re-muting the Mac (a remote-desktop session reconnecting in a loop)
+        // must not turn the log into a per-second stream.
+        let quiet = lastExternalChangeLogNanos.map {
+            Double(now &- $0) / 1_000_000_000 < Constants.externalChangeLogIntervalSeconds
+        } ?? false
+        if !quiet {
+            lastExternalChangeLogNanos = now
+            log.info("something else changed the output device "
+                     + "(volume \(String(format: "%.3f", observedScalar)) vs "
+                     + "\(String(format: "%.3f", desired))"
+                     + (volume.hasMute ? ", mute \(volume.currentMuted() ?? false) vs \(desiredMuted)" : "")
+                     + "); re-applying the sender's level")
+        }
+        writeHardwareLevel(volume: volume, scalar: desired, muted: desiredMuted)
+    }
+
+    // MARK: - status file
+
+    /// Publish what `--status` reads. Cheap (a small atomic write), called on
+    /// every state change and on the 1 Hz stats tick.
+    private func publishStatus() {
+        let status = ReceiverStatus(
+            pid: ProcessInfo.processInfo.processIdentifier,
+            name: options.name,
+            startedAtEpoch: startedAtEpoch,
+            updatedAtEpoch: Date().timeIntervalSince1970,
+            controlPort: lastControlPort,
+            udpPort: audioSocket.boundPort,
+            deviceName: device?.name,
+            deviceUID: device?.uid,
+            hardwareVolume: volume?.hasVolume ?? false,
+            streaming: streaming,
+            peer: connectedPeer,
+            lastStats: lastStatsLine,
+            logPath: log.path)
+        if let error = statusFile.write(status), !statusWriteFailureLogged {
+            // Once only: an unwritable support directory is a real problem
+            // but not one worth a line per second.
+            statusWriteFailureLogged = true
+            log.warn("could not publish the status file: \(error)")
+        }
     }
 }

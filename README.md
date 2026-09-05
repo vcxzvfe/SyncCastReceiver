@@ -63,6 +63,37 @@ On macOS 15 and later the first run raises the **Local Network** permission
 prompt. Approve it, or the Bonjour advertisement and the media socket stay
 invisible to the sender (System Settings → Privacy & Security → Local Network).
 
+### The Application Firewall
+
+If macOS's Application Firewall is on and this binary is not on its allow
+list, **the link fails in a way that looks like it is working**. The kernel
+completes the TCP handshake before the firewall adjudicates, so the sender's
+connect succeeds and `nc -z` reports the port open — but the daemon never sees
+a connection, never answers `hello`, and the sender sits waiting. On a Mac with
+nobody at the keyboard the "do you want the application to accept incoming
+network connections?" dialog is never answered, so an unsigned or ad-hoc-signed
+build stays blocked indefinitely.
+
+`--install` checks for this and prints what to do; ask at any time with:
+
+```sh
+.build/release/synccast-receiver --doctor
+```
+
+It reads `socketfilterfw --getglobalstate` and `--listapps` and reports whether
+this binary will actually be reachable. It never runs `sudo` and never changes
+a setting — if the binary needs allowing, it prints the two commands to run
+yourself:
+
+```sh
+sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add "/absolute/path/to/synccast-receiver"
+sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp "/absolute/path/to/synccast-receiver"
+```
+
+Re-run them after rebuilding to a different path. If the firewall is set to
+*block all incoming connections*, no per-application exception helps — turn
+that option off in System Settings → Network → Firewall → Options.
+
 ## Pairing
 
 On first run the daemon generates a 32-hex-character token, stores it 0600 in
@@ -88,6 +119,8 @@ link-local / loopback) address, and the connection is refused.
 | `--port <n>` | TCP control port. Default `47100`; `0` takes an ephemeral port (Bonjour still finds it). The UDP media port is always ephemeral and is reported in `hello_ack`. |
 | `--print-token` | Print the pairing token and exit. |
 | `--selftest` | Run the offline self-test (below) and exit. |
+| `--doctor` | Report whether the Application Firewall will let this binary accept connections, and print the commands to allow it. Read-only. |
+| `--status` | Print what the running daemon last published: ports, device, hardware volume, current sender, last stats line. |
 | `--install` / `--uninstall` | Manage the LaunchAgent. |
 
 List the UIDs of your output devices with any CoreAudio tool, or just pass a
@@ -108,6 +141,19 @@ stays inside ±200 ppm and converges on the clock error, that the output level
 is right, and that playout lands within a millisecond of `play_at_ns`. It
 prints `SELFTEST PASS` and exits 0 when everything holds. It takes a few
 seconds of CPU and works on a machine with no audio devices at all.
+
+## Checking on a running daemon
+
+```sh
+.build/release/synccast-receiver --status
+```
+
+The daemon republishes
+`~/Library/Application Support/SyncCastReceiver/status.json` on every state
+change and on its one-second stats tick; `--status` renders it. It says when
+the file is stale, and when the pid that wrote it is gone — so a daemon that
+died without cleaning up is reported as dead rather than described as if it
+were still playing.
 
 ## Running it by hand
 
@@ -158,6 +204,20 @@ quiet. Devices with no volume control (aggregates, most DisplayPort and HDMI
 outputs) get software gain in the render path instead, with a per-block ramp so
 a jump in the master does not click. `hello_ack.hw_volume` tells the sender
 which of the two it got.
+
+### Holding the level against the rest of the machine
+
+The output device belongs to the whole Mac, not to this daemon. While a stream
+is active the daemon watches `kAudioDevicePropertyVolumeScalar` and
+`kAudioDevicePropertyMute` on it, and if something else moves them — a
+remote-desktop session muting the Mac on connect is the usual culprit — it
+re-applies the sender's last `gain` within about 200 ms and logs one line. Its
+own writes open a short suppression window so they are not mistaken for
+somebody else's change, with a sweep just past the window's end to catch an
+external change that landed inside it. Watching stops when the stream stops:
+with no sender, the device is nobody else's business but the local user's.
+None of this applies on the software-gain path, where nothing outside this
+process can change the level.
 
 ## Uninstall
 

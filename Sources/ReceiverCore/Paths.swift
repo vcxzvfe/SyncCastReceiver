@@ -16,6 +16,10 @@ public struct ReceiverPaths: Sendable {
         home.appendingPathComponent("Library/Application Support/\(Self.appDirectoryName)", isDirectory: true)
     }
     public var configURL: URL { supportDirectory.appendingPathComponent("config.json") }
+    /// What the running daemon publishes for `--status`. Rewritten roughly
+    /// once a second, so it lives next to the config rather than in the log
+    /// directory where it would be mistaken for something worth keeping.
+    public var statusURL: URL { supportDirectory.appendingPathComponent("status.json") }
     public var logDirectory: URL {
         home.appendingPathComponent("Library/Logs/\(Self.appDirectoryName)", isDirectory: true)
     }

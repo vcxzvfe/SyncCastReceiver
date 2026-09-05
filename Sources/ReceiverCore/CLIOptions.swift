@@ -9,6 +9,12 @@ public struct CLIOptions: Equatable, Sendable {
         case selfTest
         case install
         case uninstall
+        /// Report the Application Firewall verdict for this binary, and the
+        /// commands to fix it. Reads only; never runs sudo.
+        case doctor
+        /// Print what the RUNNING daemon last published: ports, device,
+        /// hardware volume, current sender, last stats line.
+        case status
         case help
     }
 
@@ -31,7 +37,7 @@ public struct CLIOptions: Equatable, Sendable {
             case .unknownFlag(let f): return "unknown option \(f)"
             case .missingValue(let f): return "\(f) needs a value"
             case .badPort(let v): return "\(v) is not a valid TCP port (0-65535)"
-            case .conflictingActions: return "only one of --selftest/--install/--uninstall/--print-token may be given"
+            case .conflictingActions: return "only one of --selftest/--install/--uninstall/--print-token/--doctor/--status may be given"
             }
         }
     }
@@ -69,6 +75,8 @@ public struct CLIOptions: Equatable, Sendable {
             case "--print-token": try setAction(.printToken)
             case "--selftest": try setAction(.selfTest)
             case "--install": try setAction(.install)
+            case "--doctor": try setAction(.doctor)
+            case "--status": try setAction(.status)
             case "--uninstall": try setAction(.uninstall)
             case "--help", "-h": try setAction(.help)
             default:
@@ -86,6 +94,7 @@ public struct CLIOptions: Equatable, Sendable {
       synccast-receiver [--device <uid|name>] [--name <friendly>] [--port <n>]
       synccast-receiver --print-token
       synccast-receiver --selftest
+      synccast-receiver --doctor | --status
       synccast-receiver --install [flags…] | --uninstall
 
     OPTIONS
@@ -96,6 +105,9 @@ public struct CLIOptions: Equatable, Sendable {
                            0 picks an ephemeral port (the sender finds it via Bonjour).
       --print-token        Print the pairing token and exit.
       --selftest           Run the offline packet/scheduler/resampler self-test.
+      --doctor             Report whether the Application Firewall will let this
+                           binary accept connections, and how to allow it.
+      --status             Print what the running daemon last published.
       --install            Write and bootstrap the LaunchAgent, then exit.
       --uninstall          Bootout and remove the LaunchAgent, then exit.
       -h, --help           This text.

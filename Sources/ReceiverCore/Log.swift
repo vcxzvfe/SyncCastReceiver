@@ -21,10 +21,23 @@ public final class Log: @unchecked Sendable {
     private var handle: FileHandle?
     private let mirrorToStderr: Bool
     private let formatter: DateFormatter
+    private let rotationThresholdBytes: Int
+    /// Set after a rotation failed, so the next write does not try (and
+    /// report) the same thing again on every line.
+    private var rotationBroken = false
 
-    public init(paths: ReceiverPaths = ReceiverPaths(), mirrorToStderr: Bool? = nil) {
+    /// Where the lines are going. Reported by `--status` and by the install
+    /// summary, so nobody has to guess at the path.
+    public var path: String { url.path }
+
+    public init(paths: ReceiverPaths = ReceiverPaths(),
+                mirrorToStderr: Bool? = nil,
+                rotationThresholdBytes: Int = Log.rotationThresholdBytes) {
         self.url = paths.logURL
         self.rotatedURL = paths.rotatedLogURL
+        // Injectable so rotation is testable with a few hundred bytes rather
+        // than five megabytes of synthetic log.
+        self.rotationThresholdBytes = max(1, rotationThresholdBytes)
         // Interactive runs echo to the terminal; under launchd stderr is the
         // log file itself, so mirroring would duplicate every line.
         self.mirrorToStderr = mirrorToStderr ?? (isatty(STDERR_FILENO) == 1)
@@ -72,14 +85,29 @@ public final class Log: @unchecked Sendable {
     }
 
     private func rotateIfNeeded() {
-        guard let handle else { return }
+        guard let handle, !rotationBroken else { return }
         let size = (try? handle.offset()) ?? 0
-        guard size >= UInt64(Self.rotationThresholdBytes) else { return }
-        // Copy aside, then truncate in place (see the class comment).
-        if let contents = try? Data(contentsOf: url) {
-            try? contents.write(to: rotatedURL, options: [.atomic])
+        guard size >= UInt64(rotationThresholdBytes) else { return }
+        // Copy aside, THEN truncate — and only if the copy actually landed.
+        // Truncating after a failed copy would throw the log away silently,
+        // which is the one outcome worse than an oversized log.
+        do {
+            try Data(contentsOf: url).write(to: rotatedURL, options: [.atomic])
+        } catch {
+            rotationBroken = true
+            let line = "\(formatter.string(from: Date())) [\(LogLevel.error.rawValue)] "
+                + "log rotation failed, the log will keep growing: \(error)\n"
+            FileHandle.standardError.write(Data(line.utf8))
+            try? handle.write(contentsOf: Data(line.utf8))
+            return
         }
-        try? handle.truncate(atOffset: 0)
-        try? handle.seek(toOffset: 0)
+        do {
+            try handle.truncate(atOffset: 0)
+            try handle.seek(toOffset: 0)
+        } catch {
+            rotationBroken = true
+            FileHandle.standardError.write(
+                Data("could not truncate \(url.path) after rotation: \(error)\n".utf8))
+        }
     }
 }
