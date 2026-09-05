@@ -199,11 +199,20 @@ public final class JitterBuffer: @unchecked Sendable {
             addCounter(.lost, by: max(1, (missingFrames + per - 1) / per))
         }
 
+        let fillsHole = index < currentEnd
+        if fillsHole {
+            // This packet was already counted lost when the hole opened;
+            // it arrived after all, so take the count back. Single-producer,
+            // so the read-modify-write needs no CAS.
+            let current = load(.lost)
+            if current > 0 { scr_atomic_store_release(counters.advanced(by: CounterSlot.lost.rawValue), current - 1) }
+        }
         writeFrames(at: index, frames: frames, samples: samples)
         if end > currentEnd { scr_atomic_store_release(writeEnd, end) }
         bump(.accepted)
         if restarted { return .restarted(index: index) }
-        return index < currentEnd ? .reordered(index: index) : .accepted(index: index)
+        if fillsHole { bump(.reordered); return .reordered(index: index) }
+        return .accepted(index: index)
     }
 
     /// Frame index for a sender-domain timestamp under the current anchor.
