@@ -35,6 +35,14 @@ public final class ReceiverDaemon: @unchecked Sendable {
         /// How often the "something else changed the level" line may repeat
         /// while the same fight is still going on.
         static let externalChangeLogIntervalSeconds: Double = 5
+        /// Smallest change to the effective target worth a splice.
+        static let targetChangeThresholdMs: Double = 5
+        /// How long the effective target must hold still between changes.
+        /// The jitter measurement moves continuously; re-targeting on every
+        /// tick would be a splice per second.
+        static let targetChangeIntervalSeconds: Double = 10
+        /// How often the "raised the target" line may repeat.
+        static let targetClampLogIntervalSeconds: Double = 60
     }
 
     private let options: Options
@@ -80,6 +88,15 @@ public final class ReceiverDaemon: @unchecked Sendable {
     private let statusFile: StatusFile
     private let startedAtEpoch = Date().timeIntervalSince1970
     private var lastStatsLine: String?
+    /// What the sender asked for, and what we settled on after measuring the
+    /// link. They differ when the link is too jittery for the request.
+    private var requestedTargetMs: Double
+    private var effectiveTargetMs: Double
+    private var lastTargetChangeNanos: UInt64?
+    private var lastTargetClampLogNanos: UInt64?
+    /// Sequence number of the last re-anchor already written to the log.
+    private var loggedReanchorSequence: Int = 0
+    private var loggedReanchorTotal: Int = 0
     private var lastControlPort: UInt16 = 0
     private var statusWriteFailureLogged = false
 
@@ -90,6 +107,8 @@ public final class ReceiverDaemon: @unchecked Sendable {
         self.log = log
         self.statusFile = statusFile ?? StatusFile()
         self.engine = PlayoutEngine()
+        self.requestedTargetMs = options.defaultTargetMilliseconds
+        self.effectiveTargetMs = options.defaultTargetMilliseconds
         self.engine.setTargetLatency(milliseconds: options.defaultTargetMilliseconds)
         self.audioSocket = AudioSocket(engine: engine) { [weak self] message in
             self?.log.warn("media socket: \(message)")
@@ -284,8 +303,15 @@ public final class ReceiverDaemon: @unchecked Sendable {
         case .gain(let gain):
             applyGain(linear: gain.linear, muted: gain.muted)
         case .latency(let latency):
-            engine.setTargetLatency(milliseconds: Double(latency.targetMs))
-            log.info("target latency set to \(latency.targetMs) ms")
+            requestedTargetMs = Double(latency.targetMs)
+            lastTargetChangeNanos = nil
+            let effective = applyTargetLatency(force: true)
+            if effective > requestedTargetMs + 0.5 {
+                log.info("target latency set to \(latency.targetMs) ms, raised to "
+                         + "\(Int(effective.rounded())) ms by the measured link jitter")
+            } else {
+                log.info("target latency set to \(latency.targetMs) ms")
+            }
         case .ping(let ping):
             handlePing(ping)
         case .bye:
@@ -317,6 +343,16 @@ public final class ReceiverDaemon: @unchecked Sendable {
         if audioSocket.boundPort == 0 { openMediaSocket() }
 
         connectedPeer = peer
+        // A new stream is a new link measurement: the previous sender's
+        // jitter says nothing about this one's.
+        engine.arrivalTracker.reset()
+        requestedTargetMs = options.defaultTargetMilliseconds
+        effectiveTargetMs = requestedTargetMs
+        lastTargetChangeNanos = nil
+        lastTargetClampLogNanos = nil
+        loggedReanchorSequence = 0
+        loggedReanchorTotal = 0
+        engine.setTargetLatency(milliseconds: requestedTargetMs)
         offsetEstimator.reset()
         pendingExchange = nil
         lastPingNanos = clock.nowNanos()
@@ -332,6 +368,9 @@ public final class ReceiverDaemon: @unchecked Sendable {
                                   device: device.name,
                                   deviceUID: device.uid,
                                   hwVolume: volume?.hasVolume ?? false,
+                                  // The EFFECTIVE target, not the requested
+                                  // one: the sender aligns its local legs on
+                                  // this number, so it has to be the truth.
                                   bufferMs: Int(engine.targetLatencyMilliseconds.rounded()))
         controlServer?.send(.helloAck(ack))
         log.info("stream \(hello.streamID) from \"\(hello.name)\" at \(peer): "
@@ -428,21 +467,95 @@ public final class ReceiverDaemon: @unchecked Sendable {
 
     private func emitStats() {
         guard streaming else { return }
+        applyTargetLatency(force: false)
         let snapshot = engine.snapshot
         let message = StatsMessage(late: snapshot.counters.late,
                                    lost: snapshot.counters.lost,
                                    underrun: snapshot.counters.underrun,
                                    bufferMs: (snapshot.levelMilliseconds * 100).rounded() / 100,
                                    ratio: (snapshot.ratio * 1e9).rounded() / 1e9,
-                                   clip: snapshot.clip)
+                                   clip: snapshot.clip,
+                                   reanchorStarved: snapshot.reanchorsByReason[.starved] ?? 0,
+                                   reanchorError: snapshot.reanchorsByReason[.error] ?? 0,
+                                   p95JitterMs: snapshot.p95JitterMilliseconds
+                                       .map { ($0 * 100).rounded() / 100 },
+                                   targetMs: (engine.targetLatencyMilliseconds * 10).rounded() / 10)
         controlServer?.send(.stats(message))
+        let jitter = message.p95JitterMs.map { String(format: "%.1fms", $0) } ?? "-"
         let line = "late=\(message.late) lost=\(message.lost) underrun=\(message.underrun) "
             + "buffer=\(String(format: "%.1f", message.bufferMs))ms "
             + "trim=\(String(format: "%+.1f", (message.ratio - 1) * 1e6))ppm "
             + "clip=\(message.clip) reanchor=\(snapshot.reanchors)"
+            + "(starved=\(message.reanchorStarved) error=\(message.reanchorError)) "
+            + "p95jitter=\(jitter) target=\(String(format: "%.0f", message.targetMs))ms"
         lastStatsLine = line
         log.debug("stats \(line)")
+        logReanchorIfNew(snapshot)
         publishStatus()
+    }
+
+    /// One INFO line per re-anchor, at most one per stats tick.
+    ///
+    /// A splice is audible, so the reason it happened belongs in the log at a
+    /// level the user actually reads — but a link that is spliced repeatedly
+    /// would otherwise write a line per event, hundreds a minute. The 1 Hz
+    /// tick is the rate limit, and the count of what it swallowed is on the
+    /// line so nothing is hidden.
+    private func logReanchorIfNew(_ snapshot: PlayoutEngine.Snapshot) {
+        guard let event = snapshot.lastReanchor, event.sequence != loggedReanchorSequence else {
+            loggedReanchorTotal = snapshot.reanchors
+            return
+        }
+        let swallowed = max(0, snapshot.reanchors - loggedReanchorTotal - 1)
+        loggedReanchorSequence = event.sequence
+        loggedReanchorTotal = snapshot.reanchors
+        let extra = swallowed > 0 ? " (+\(swallowed) more since the last line)" : ""
+        log.info("re-anchored the playout cursor: \(event.reason.rawValue) — "
+                 + "level error \(String(format: "%+.1f", event.errorMilliseconds)) ms, "
+                 + "ring fill \(String(format: "%.1f", event.fillMilliseconds)) ms, "
+                 + "\(event.starvedBlocks) starved block(s)\(extra)")
+    }
+
+    /// Raise the playout target to what the measured link needs, if it needs
+    /// more than the sender asked for.
+    ///
+    /// Changing it splices, so it is deliberately sticky: only a change worth
+    /// at least `targetChangeThresholdMs`, and at most one every
+    /// `targetChangeIntervalSeconds`.
+    @discardableResult
+    private func applyTargetLatency(force: Bool) -> Double {
+        let blockFrames = output?.renderBlockFrames ?? WireFormat.framesPerPacket
+        let wanted = TargetLatencyPolicy.effectiveMilliseconds(
+            requestedMs: requestedTargetMs,
+            p95JitterMs: engine.snapshot.p95JitterMilliseconds,
+            blockFrames: blockFrames,
+            sampleRate: engine.sampleRate)
+        let now = clock.nowNanos()
+        if !force {
+            guard abs(wanted - effectiveTargetMs) >= Constants.targetChangeThresholdMs else {
+                return effectiveTargetMs
+            }
+            let settled = lastTargetChangeNanos.map {
+                Double(now &- $0) / 1_000_000_000 >= Constants.targetChangeIntervalSeconds
+            } ?? true
+            guard settled else { return effectiveTargetMs }
+        }
+        effectiveTargetMs = wanted
+        lastTargetChangeNanos = now
+        engine.setTargetLatency(milliseconds: wanted)
+        if wanted > requestedTargetMs + 0.5 {
+            let quiet = lastTargetClampLogNanos.map {
+                Double(now &- $0) / 1_000_000_000 < Constants.targetClampLogIntervalSeconds
+            } ?? false
+            if !quiet {
+                lastTargetClampLogNanos = now
+                let jitter = engine.snapshot.p95JitterMilliseconds ?? 0
+                log.info("raised the playout target from \(Int(requestedTargetMs.rounded())) ms to "
+                         + "\(Int(wanted.rounded())) ms: this link's p95 arrival jitter is "
+                         + "\(String(format: "%.1f", jitter)) ms and the buffer has to cover it")
+            }
+        }
+        return wanted
     }
 
     // MARK: - level re-assertion

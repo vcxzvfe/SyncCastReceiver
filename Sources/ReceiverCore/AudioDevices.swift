@@ -105,12 +105,20 @@ public enum AudioDevices {
     /// leaving the DAC: the device's own latency, the HAL's safety offset and
     /// one IO buffer. Subtracting this is what makes `play_at_ns` mean "at
     /// the speaker" rather than "at the callback".
+    /// The device's IO buffer size — the quantum the render callback is
+    /// handed. 512 frames when the device does not answer, which is what
+    /// macOS uses by default.
+    public static func bufferFrames(_ deviceID: AudioDeviceID) -> Int {
+        let frames = uint32Property(deviceID, kAudioDevicePropertyBufferFrameSize, scope: kAudioObjectPropertyScopeOutput)
+            ?? uint32Property(deviceID, kAudioDevicePropertyBufferFrameSize, scope: kAudioObjectPropertyScopeGlobal)
+            ?? 512
+        return Int(frames)
+    }
+
     public static func outputLatencyFrames(_ deviceID: AudioDeviceID) -> Int {
         let latency = uint32Property(deviceID, kAudioDevicePropertyLatency, scope: kAudioObjectPropertyScopeOutput) ?? 0
         let safety = uint32Property(deviceID, kAudioDevicePropertySafetyOffset, scope: kAudioObjectPropertyScopeOutput) ?? 0
-        let buffer = uint32Property(deviceID, kAudioDevicePropertyBufferFrameSize, scope: kAudioObjectPropertyScopeOutput)
-            ?? uint32Property(deviceID, kAudioDevicePropertyBufferFrameSize, scope: kAudioObjectPropertyScopeGlobal)
-            ?? 512
+        let buffer = UInt32(bufferFrames(deviceID))
         // Stream latency is reported separately from device latency and is
         // non-zero on plenty of hardware; include it when the device has an
         // output stream that answers.

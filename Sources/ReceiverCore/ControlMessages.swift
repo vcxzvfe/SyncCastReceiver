@@ -95,15 +95,52 @@ public struct StatsMessage: Codable, Equatable, Sendable {
     public var bufferMs: Double
     public var ratio: Double
     public var clip: Int
+    /// Hard re-anchors — audible splices — since the stream started, split by
+    /// cause. A sender that sees these climbing knows the link is not merely
+    /// jittery, it is being spliced, and which of the two faults is doing it.
+    public var reanchorStarved: Int
+    public var reanchorError: Int
+    /// Arrival spread of the last few seconds of packets (p95 − min), in ms.
+    /// The floor a sensible `target_ms` has to clear; nil until measured.
+    public var p95JitterMs: Double?
+    /// The target this receiver is ACTUALLY running at, which may be above
+    /// the one the sender asked for. See `TargetLatencyPolicy`.
+    public var targetMs: Double
 
     enum CodingKeys: String, CodingKey {
         case late, lost, underrun, ratio, clip
         case bufferMs = "buffer_ms"
+        case reanchorStarved = "reanchor_starved"
+        case reanchorError = "reanchor_error"
+        case p95JitterMs = "p95_jitter_ms"
+        case targetMs = "target_ms"
     }
 
-    public init(late: Int, lost: Int, underrun: Int, bufferMs: Double, ratio: Double, clip: Int) {
+    public init(late: Int, lost: Int, underrun: Int, bufferMs: Double, ratio: Double, clip: Int,
+                reanchorStarved: Int = 0, reanchorError: Int = 0,
+                p95JitterMs: Double? = nil, targetMs: Double = 0) {
         self.late = late; self.lost = lost; self.underrun = underrun
         self.bufferMs = bufferMs; self.ratio = ratio; self.clip = clip
+        self.reanchorStarved = reanchorStarved
+        self.reanchorError = reanchorError
+        self.p95JitterMs = p95JitterMs
+        self.targetMs = targetMs
+    }
+
+    /// Decoded leniently: every field added after v1 defaults rather than
+    /// failing, so a receiver and a sender from different builds still talk.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        late = try container.decode(Int.self, forKey: .late)
+        lost = try container.decode(Int.self, forKey: .lost)
+        underrun = try container.decode(Int.self, forKey: .underrun)
+        bufferMs = try container.decode(Double.self, forKey: .bufferMs)
+        ratio = try container.decode(Double.self, forKey: .ratio)
+        clip = try container.decode(Int.self, forKey: .clip)
+        reanchorStarved = try container.decodeIfPresent(Int.self, forKey: .reanchorStarved) ?? 0
+        reanchorError = try container.decodeIfPresent(Int.self, forKey: .reanchorError) ?? 0
+        p95JitterMs = try container.decodeIfPresent(Double.self, forKey: .p95JitterMs)
+        targetMs = try container.decodeIfPresent(Double.self, forKey: .targetMs) ?? 0
     }
 }
 

@@ -29,6 +29,8 @@ public final class AUHALOutput: @unchecked Sendable {
     private let clock = MachClock()
     /// Device latency in host-clock nanoseconds, refreshed at start.
     private let latencyNanos = AtomicInt64(0)
+    /// The device's IO buffer size, refreshed alongside the latency.
+    private let blockFrames = AtomicInt64(512)
     private let running = AtomicBool(false)
 
     public init(device: AudioOutputDevice, engine: PlayoutEngine) {
@@ -41,6 +43,9 @@ public final class AUHALOutput: @unchecked Sendable {
     public var isRunning: Bool { running.value }
     public var outputLatencyNanos: UInt64 { UInt64(max(0, latencyNanos.value)) }
     public var outputLatencyMilliseconds: Double { Double(outputLatencyNanos) / 1_000_000 }
+    /// Frames per render callback. The granularity this side can react at,
+    /// and therefore the unit the target-latency floor is quoted in.
+    public var renderBlockFrames: Int { Int(max(1, blockFrames.value)) }
 
     public func start() throws {
         guard unit == nil else { return }
@@ -123,6 +128,7 @@ public final class AUHALOutput: @unchecked Sendable {
         let rate = device.nominalSampleRate > 0 ? device.nominalSampleRate : engine.sampleRate
         let nanos = AudioDevices.outputLatencyNanos(device.id, sampleRate: rate)
         latencyNanos.value = Int64(nanos)
+        blockFrames.value = Int64(AudioDevices.bufferFrames(device.id))
         // The engine needs it in ITS frames (the client format's rate), not
         // the device's, because that is what the ring is counted in.
         engine.setDeviceLatency(frames: Int(Double(nanos) / 1_000_000_000 * engine.sampleRate))
