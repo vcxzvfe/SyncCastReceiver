@@ -21,7 +21,7 @@ public enum SelfTest {
     }
 
     /// Deterministic pseudo-random source, so a failure is reproducible.
-    private struct LCG {
+    struct LCG {
         var state: UInt64 = 0x2545_F491_4F6C_DD1D
         mutating func next() -> UInt64 {
             state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
@@ -30,10 +30,49 @@ public enum SelfTest {
         mutating func chance(oneIn n: UInt64) -> Bool { next() % n == 0 }
     }
 
+    /// Build one packet, put it on the wire, take it off again and hand it
+    /// to the engine — the real encoder, the real parser, the real ring.
+    ///
+    /// Shared by every scenario so they all exercise the same path; only the
+    /// delivery SCHEDULE differs between them.
+    @discardableResult
+    static func encodeParseIngest(index: Int,
+                                  senderStart: UInt64,
+                                  packetNanos: Double,
+                                  arrivalNanos: UInt64,
+                                  scratch: inout [Int16],
+                                  engine: PlayoutEngine) -> Bool {
+        var samples = [Int16](repeating: 0, count: WireFormat.framesPerPacket * WireFormat.channelCount)
+        for f in 0..<WireFormat.framesPerPacket {
+            let v = sample(atFrame: index * WireFormat.framesPerPacket + f)
+            let s = Int16(max(-32_767, min(32_767, (v * 32_767).rounded())))
+            samples[f * 2] = s
+            samples[f * 2 + 1] = s
+        }
+        let header = AudioPacketHeader(streamID: 0x5157_3A01,
+                                       seq: UInt32(truncatingIfNeeded: index),
+                                       playAtNanos: senderStart &+ UInt64((Double(index) * packetNanos).rounded()),
+                                       frames: UInt32(WireFormat.framesPerPacket))
+        let bytes = buildAudioPacket(header: header, samples: samples)
+        guard let parsed = try? bytes.withUnsafeBytes({ raw -> AudioPacketHeader in
+            let h = try AudioPacketHeader.decode(raw)
+            try scratch.withUnsafeMutableBufferPointer { out in
+                _ = try decodeInt16Payload(raw, offset: WireFormat.headerByteCount,
+                                           sampleCount: WireFormat.framesPerPacket * WireFormat.channelCount,
+                                           into: out.baseAddress!)
+            }
+            return h
+        }) else { return false }
+        _ = scratch.withUnsafeBufferPointer {
+            engine.ingest(header: parsed, samples: $0.baseAddress!, arrivalNanos: arrivalNanos)
+        }
+        return true
+    }
+
     /// Test signal: a 30 Hz fundamental (period 1600 frames, so the timing
     /// correlation below is unambiguous over ±10 ms) plus a 1 kHz tone that
     /// would show up as ripple if the resampler were dropping samples.
-    private static func sample(atFrame frame: Int) -> Double {
+    static func sample(atFrame frame: Int) -> Double {
         let t = Double(frame) / WireFormat.sampleRate
         return 0.4 * sin(2 * .pi * 30 * t) + 0.1 * sin(2 * .pi * 1_000 * t)
     }
@@ -86,28 +125,9 @@ public enum SelfTest {
 
         /// Encode → wire bytes → decode → ingest, exactly as the UDP thread does.
         func deliver(index: Int, duplicate: Bool = false) {
-            var samples = [Int16](repeating: 0, count: WireFormat.framesPerPacket * WireFormat.channelCount)
-            for f in 0..<WireFormat.framesPerPacket {
-                let v = sample(atFrame: index * WireFormat.framesPerPacket + f)
-                let s = Int16(max(-32_767, min(32_767, (v * 32_767).rounded())))
-                samples[f * 2] = s
-                samples[f * 2 + 1] = s
-            }
-            let header = AudioPacketHeader(streamID: 0x5157_3A01,
-                                           seq: UInt32(truncatingIfNeeded: index),
-                                           playAtNanos: playAt(index),
-                                           frames: UInt32(WireFormat.framesPerPacket))
-            let bytes = buildAudioPacket(header: header, samples: samples)
-            guard let parsed = try? bytes.withUnsafeBytes({ raw -> AudioPacketHeader in
-                let h = try AudioPacketHeader.decode(raw)
-                try scratch.withUnsafeMutableBufferPointer { out in
-                    _ = try decodeInt16Payload(raw, offset: WireFormat.headerByteCount,
-                                               sampleCount: WireFormat.framesPerPacket * WireFormat.channelCount,
-                                               into: out.baseAddress!)
-                }
-                return h
-            }) else { return }
-            _ = scratch.withUnsafeBufferPointer { engine.ingest(header: parsed, samples: $0.baseAddress!) }
+            guard encodeParseIngest(index: index, senderStart: senderStart,
+                                    packetNanos: packetNanos, arrivalNanos: localNow,
+                                    scratch: &scratch, engine: engine) else { return }
             if !duplicate { sent += 1 }
         }
 

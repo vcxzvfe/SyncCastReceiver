@@ -24,12 +24,18 @@ case .help:
 case .selfTest:
     // No config, no network, no CoreAudio: this must work on a machine with
     // no audio hardware at all.
-    let report = SelfTest.run { print($0) }
-    if report.passed {
+    // Two links, because they fail differently: a steady one (a wired LAN)
+    // and a bursty one (Wi-Fi, where the receiver used to splice several
+    // times a second).
+    let steady = SelfTest.run { print($0) }
+    print("")
+    let bursty = SelfTest.runBurstyArrival { print($0) }
+    let checks = steady.checks + bursty.checks
+    if checks.allSatisfy(\.passed) {
         print("SELFTEST PASS")
         exit(0)
     }
-    let failed = report.checks.filter { !$0.passed }.map(\.name).joined(separator: ", ")
+    let failed = checks.filter { !$0.passed }.map(\.name).joined(separator: ", ")
     print("SELFTEST FAIL (\(failed))")
     exit(1)
 
