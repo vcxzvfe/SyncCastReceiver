@@ -18,12 +18,34 @@ public final class PlayoutEngine: @unchecked Sendable {
         public var counters: JitterBuffer.Counters
         public var clip: Int
         public var reanchors: Int
+        /// Hard re-anchors broken down by what caused them. The sum is
+        /// `reanchors`.
+        public var reanchorsByReason: [ClockFollowLoop.ReanchorReason: Int]
+        /// The most recent re-anchor, for the log line that explains it.
+        public var lastReanchor: ReanchorEvent?
         /// EMA-smoothed buffer level, the number worth showing a user.
         public var levelMilliseconds: Double
         /// Instantaneous ring fill at the moment of the snapshot.
         public var fillMilliseconds: Double
+        /// Arrival spread of the last few seconds of packets, in ms, or nil
+        /// before enough have arrived. See `PacketArrivalTracker`.
+        public var p95JitterMilliseconds: Double?
         public var ratio: Double
         public var isPlaying: Bool
+    }
+
+    /// One hard re-anchor, with the numbers that explain it.
+    public struct ReanchorEvent: Equatable, Sendable {
+        /// Monotonically increasing; a reader can tell a new event from a
+        /// repeat of the one it already logged.
+        public var sequence: Int
+        public var reason: ClockFollowLoop.ReanchorReason
+        /// Smoothed level error against the setpoint when it fired.
+        public var errorMilliseconds: Double
+        /// Instantaneous ring fill when it fired.
+        public var fillMilliseconds: Double
+        /// Render blocks in a row that had found the ring empty.
+        public var starvedBlocks: Int
     }
 
     public let buffer: JitterBuffer
@@ -45,8 +67,26 @@ public final class PlayoutEngine: @unchecked Sendable {
     private let mutedBox = AtomicBool(false)
     private let clipBox = AtomicInt64(0)
     private let reanchorBox = AtomicInt64(0)
+    private let reanchorStarvedBox = AtomicInt64(0)
+    private let reanchorErrorBox = AtomicInt64(0)
+    private let reanchorTargetBox = AtomicInt64(0)
     private let playingBox = AtomicBool(false)
     private let anchoredBox = AtomicBool(false)
+    /// The target moved under a running stream, so the level has to jump.
+    private let targetMovedBox = AtomicBool(false)
+
+    // The last re-anchor, published field by field because the render thread
+    // may not allocate. `lastReanchorSequence` is written LAST, so a reader
+    // that sees a new sequence number also sees the numbers that go with it.
+    private let lastReanchorReasonBox = AtomicInt64(0)
+    private let lastReanchorErrorBox = AtomicDouble(0)
+    private let lastReanchorFillBox = AtomicDouble(0)
+    private let lastReanchorStarvedBox = AtomicInt64(0)
+    private let lastReanchorSequenceBox = AtomicInt64(0)
+
+    /// Arrival-jitter measurement, fed from the UDP thread.
+    public let arrivalTracker = PacketArrivalTracker()
+    private let clock = MachClock()
 
     /// Render-thread scratch. Sized for a very large AUHAL buffer (8192
     /// frames is 170 ms at 48 kHz; no output device asks for more) plus the
@@ -113,9 +153,25 @@ public final class PlayoutEngine: @unchecked Sendable {
         anchoredBox.value = false
     }
 
+    /// Set the playout target.
+    ///
+    /// Moving it moves the water level's setpoint, and the trim can only walk
+    /// the level at ±200 ppm — 0.2 ms per second, so a 30 ms change would take
+    /// two and a half minutes. A target change is a deliberate, known event
+    /// (the user moved a slider, or this side raised the floor to match the
+    /// link), so the level JUMPS to the new setpoint instead: one splice at a
+    /// moment the listener is expecting a change, rather than minutes of
+    /// playing at the wrong latency.
+    ///
+    /// A change smaller than half a packet is not worth a splice.
     public func setTargetLatency(milliseconds: Double) {
         let clamped = min(max(milliseconds, 10), 1_000)
-        targetFramesBox.value = Int64(clamped / 1000 * sampleRate)
+        let frames = Int64(clamped / 1000 * sampleRate)
+        let previous = targetFramesBox.value
+        targetFramesBox.value = frames
+        if anchoredBox.value, abs(frames - previous) > Int64(WireFormat.framesPerPacket / 2) {
+            targetMovedBox.value = true
+        }
     }
 
     public var targetLatencyMilliseconds: Double {
@@ -178,6 +234,9 @@ public final class PlayoutEngine: @unchecked Sendable {
         buffer.resetCounters()
         clipBox.value = 0
         reanchorBox.value = 0
+        reanchorStarvedBox.value = 0
+        reanchorErrorBox.value = 0
+        reanchorTargetBox.value = 0
     }
 
     public var snapshot: Snapshot {
@@ -185,17 +244,71 @@ public final class PlayoutEngine: @unchecked Sendable {
         return Snapshot(counters: buffer.counterSnapshot,
                  clip: Int(clipBox.value),
                  reanchors: Int(reanchorBox.value),
+                 reanchorsByReason: [
+                    .starved: Int(reanchorStarvedBox.value),
+                    .error: Int(reanchorErrorBox.value),
+                    .target: Int(reanchorTargetBox.value),
+                 ],
+                 lastReanchor: lastReanchor,
                  levelMilliseconds: level.isNaN ? buffer.fillMilliseconds : level / sampleRate * 1000,
                  fillMilliseconds: buffer.fillMilliseconds,
+                 p95JitterMilliseconds: arrivalTracker.p95SpreadMilliseconds,
                  ratio: ratioPublished.value,
                  isPlaying: playingBox.value)
+    }
+
+    /// The most recent hard re-anchor, or nil if there has not been one.
+    public var lastReanchor: ReanchorEvent? {
+        let sequence = Int(lastReanchorSequenceBox.value)
+        guard sequence > 0,
+              let reason = Self.reason(fromCode: lastReanchorReasonBox.value) else { return nil }
+        return ReanchorEvent(sequence: sequence,
+                             reason: reason,
+                             errorMilliseconds: lastReanchorErrorBox.value,
+                             fillMilliseconds: lastReanchorFillBox.value,
+                             starvedBlocks: Int(lastReanchorStarvedBox.value))
+    }
+
+    private static func code(for reason: ClockFollowLoop.ReanchorReason) -> Int64 {
+        switch reason {
+        case .starved: return 1
+        case .error: return 2
+        case .target: return 3
+        }
+    }
+
+    private static func reason(fromCode code: Int64) -> ClockFollowLoop.ReanchorReason? {
+        switch code {
+        case 1: return .starved
+        case 2: return .error
+        case 3: return .target
+        default: return nil
+        }
     }
 
     // MARK: - UDP thread
 
     @discardableResult
     public func ingest(header: AudioPacketHeader, samples: UnsafePointer<Int16>) -> JitterBuffer.IngestOutcome {
-        buffer.ingest(header: header, samples: samples)
+        ingest(header: header, samples: samples, arrivalNanos: clock.nowNanos())
+    }
+
+    /// Ingest with an explicit arrival timestamp, so the offline self-test can
+    /// drive the same arrival-jitter measurement from its simulated clock.
+    @discardableResult
+    public func ingest(header: AudioPacketHeader,
+                       samples: UnsafePointer<Int16>,
+                       arrivalNanos: UInt64) -> JitterBuffer.IngestOutcome {
+        let outcome = buffer.ingest(header: header, samples: samples)
+        switch outcome {
+        case .accepted, .reordered, .restarted:
+            arrivalTracker.record(playAtNanos: header.playAtNanos, arrivalNanos: arrivalNanos)
+        case .late, .duplicate:
+            // A duplicate says nothing new about the link, and a late packet's
+            // delay is already past the point the buffer could have used it.
+            break
+        }
+        return outcome
     }
 
     // MARK: - Render thread
@@ -225,18 +338,41 @@ public final class PlayoutEngine: @unchecked Sendable {
             loop.reset(fillFrames: Double(buffer.fillFrames))
             stagingCount = 0
             anchoredBox.value = true
+            // The cold-start anchor already put the cursor where the new
+            // target says; there is nothing left for a target jump to do.
+            targetMovedBox.value = false
         }
 
+        let fillFrames = Double(buffer.fillFrames)
         let dt = Double(frames) / sampleRate
-        let outcome = loop.update(fillFrames: Double(buffer.fillFrames),
+        let outcome = loop.update(fillFrames: fillFrames,
                                   targetFrames: Double(targetFrames),
                                   dt: dt)
-        if outcome == .reanchorNeeded {
+        var reanchorReason: ClockFollowLoop.ReanchorReason?
+        if case .reanchorNeeded(let reason) = outcome { reanchorReason = reason }
+        if targetMovedBox.value {
+            targetMovedBox.value = false
+            reanchorReason = .target
+        }
+        if let reason = reanchorReason {
+            let errorMs = loop.errorMilliseconds(targetFrames: Double(targetFrames))
+            let starved = loop.consecutiveStarvedBlocks
             buffer.reanchorReadCursor(toLevelFrames: targetFrames)
             resampler.reset()
             loop.reset(fillFrames: Double(targetFrames))
             stagingCount = 0
             reanchorBox.add(1)
+            switch reason {
+            case .starved: reanchorStarvedBox.add(1)
+            case .error: reanchorErrorBox.add(1)
+            case .target: reanchorTargetBox.add(1)
+            }
+            lastReanchorReasonBox.value = Self.code(for: reason)
+            lastReanchorErrorBox.value = errorMs
+            lastReanchorFillBox.value = fillFrames / sampleRate * 1000
+            lastReanchorStarvedBox.value = Int64(starved)
+            // Published last: a reader that sees this also sees the rest.
+            lastReanchorSequenceBox.add(1)
         }
         let ratio = loop.ratio
         ratioPublished.value = ratio

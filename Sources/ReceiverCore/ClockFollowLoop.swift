@@ -18,18 +18,21 @@ import Foundation
 /// ```
 /// ωn = √(R·Ki)          2ζωn = R·Kp
 /// ```
-/// The defaults place `ωn = 0.3 rad/s`, `ζ = 1.2` — overdamped, poles at
-/// −0.74 and −0.12 rad/s, so a ±100 ppm crystal error is tracked to within a
-/// few ppm inside ten seconds and a cold start settles fully in under a
-/// minute, while the correction itself only ever moves at a few hundred ppm
-/// per second (an inaudible pitch sweep).
+/// The defaults place `ωn = 0.15 rad/s`, `ζ = 1.2` — overdamped, so a ±100 ppm
+/// crystal error is tracked to within a few ppm inside twenty-five seconds
+/// and the correction itself only ever moves at a few hundred ppm per second
+/// (an inaudible pitch sweep).
 ///
 /// The bandwidth is deliberately no higher than that: `Kp` multiplies the
 /// measurement noise straight into the pitch, and the level measurement is
-/// only as clean as the network. At `Kp = 1.5e-5` a residual ±3 frames of
-/// level noise is ±40 ppm of trim — inaudible. Ten times the bandwidth would
-/// track a crystal in half a second and wobble the pitch by the full ±200 ppm
-/// clamp on any jittery link, which is the wrong trade for a music path.
+/// only as clean as the network. A field run over Wi-Fi showed the trim
+/// swinging across 120 ppm within seconds — the loop chasing arrival jitter
+/// rather than a crystal — which is why the controller now runs on a 3 s EMA
+/// at half the previous natural frequency. Both halve the noise that reaches
+/// the pitch; the price is a settling time about twice as long, which nobody
+/// can hear and which matters only in the self-test's warm-up budget.
+/// (The 3 s filter costs phase margin at the old 0.3 rad/s — about 20° — so
+/// the two changes belong together, not separately.)
 ///
 /// # Guards
 ///  * `|u|` is clamped to ±200 ppm (spec) — 0.35 cent, inaudible, and far
@@ -44,10 +47,25 @@ import Foundation
 ///    sawtooth is the true level. (A peak-hold, which is tempting because
 ///    delivery jitter is one-sided, latches the TOP of those sawtooths
 ///    instead and biases the level by the best part of 20 ms.)
-///  * Beyond ±20 ms of level error the loop reports `.reanchorNeeded`: no
-///    ±200 ppm trim can walk that back in reasonable time, so the caller
-///    jumps the read cursor instead (an audible splice, but only on a real
-///    fault: startup, sleep/wake, a network stall).
+///  * A hard re-anchor is a SPLICE — an audible click — so it is reported
+///    only for a fault that no trim can fix, and only once that fault has
+///    proved itself:
+///      - `.error`: the smoothed level has been more than `reanchorErrorMs`
+///        away from the setpoint CONTINUOUSLY for `reanchorHoldSeconds`.
+///        A ±200 ppm trim moves the level by 0.2 ms per second, so a 20 ms
+///        error really is unrecoverable — but a single burst of late packets
+///        also shows a 20 ms error for one tick, and jumping on that is how
+///        a link on Wi-Fi ends up clicking several times a second.
+///      - `.starved`: the ring ran dry for `starvedBlockLimit` consecutive
+///        render blocks AND the smoothed level agrees the buffer is short by
+///        at least `starvationConfirmMs`. One empty render is a delivery gap:
+///        the correct response is zero-fill plus an `underrun` count, and the
+///        audio that is a millisecond away then plays normally. Only a
+///        deficit the smoothed level can see is a real one.
+///
+/// Both thresholds are tuning fields rather than constants, because the right
+/// value depends on the link: a wired receiver can be far stricter than one
+/// behind two Wi-Fi hops.
 public struct ClockFollowLoop: Sendable {
 
     public struct Tuning: Sendable {
@@ -59,20 +77,41 @@ public struct ClockFollowLoop: Sendable {
         public var maxRatioPpm: Double
         /// Clamp on |d(ratio)/dt|, in ppm per second.
         public var slewPpmPerSecond: Double
-        /// Time constant of the fill EMA, seconds.
+        /// Time constant of the REPORTED fill EMA, seconds. Fast enough that
+        /// a user watching `stats` sees the buffer move.
         public var fillFilterSeconds: Double
+        /// Time constant of the EMA the CONTROLLER sees, seconds.
+        ///
+        /// Longer than the reported one on purpose: `kp` multiplies whatever
+        /// noise survives the filter straight into the pitch, and on a Wi-Fi
+        /// link the level carries tens of milliseconds of arrival jitter. A
+        /// filter this slow costs phase margin, which is why the default
+        /// natural frequency below is half what it was when the loop ran on
+        /// the fast EMA.
+        public var controlFilterSeconds: Double
         /// Level error beyond which the caller must hard re-anchor, in ms.
         public var reanchorErrorMs: Double
+        /// How long that error must persist before the re-anchor fires.
+        public var reanchorHoldSeconds: Double
+        /// Consecutive empty render blocks that count as real starvation.
+        public var starvedBlockLimit: Int
+        /// How far below the setpoint the SMOOTHED level must sit before a
+        /// run of empty blocks is believed, in ms.
+        public var starvationConfirmMs: Double
         /// Nominal device rate, used for the ms ↔ frames conversions.
         public var sampleRate: Double
 
         public init(sampleRate: Double = WireFormat.sampleRate,
-                    naturalFrequency: Double = 0.3,
+                    naturalFrequency: Double = 0.15,
                     dampingRatio: Double = 1.2,
                     maxRatioPpm: Double = 200,
                     slewPpmPerSecond: Double = 400,
                     fillFilterSeconds: Double = 1.5,
-                    reanchorErrorMs: Double = 20) {
+                    controlFilterSeconds: Double = 3.0,
+                    reanchorErrorMs: Double = 20,
+                    reanchorHoldSeconds: Double = 0.5,
+                    starvedBlockLimit: Int = 2,
+                    starvationConfirmMs: Double = 10) {
             precondition(sampleRate > 0)
             self.sampleRate = sampleRate
             self.ki = naturalFrequency * naturalFrequency / sampleRate
@@ -80,17 +119,45 @@ public struct ClockFollowLoop: Sendable {
             self.maxRatioPpm = maxRatioPpm
             self.slewPpmPerSecond = slewPpmPerSecond
             self.fillFilterSeconds = fillFilterSeconds
+            self.controlFilterSeconds = controlFilterSeconds
             self.reanchorErrorMs = reanchorErrorMs
+            self.reanchorHoldSeconds = reanchorHoldSeconds
+            self.starvedBlockLimit = max(1, starvedBlockLimit)
+            self.starvationConfirmMs = starvationConfirmMs
         }
     }
 
-    public enum Outcome: Equatable, Sendable { case tracking, reanchorNeeded }
+    /// Why the caller was told to splice. Reported in `stats` so the reason a
+    /// link clicks can be read off a log instead of guessed at.
+    public enum ReanchorReason: String, Equatable, Sendable {
+        /// The ring ran dry for several consecutive render blocks and the
+        /// smoothed level agrees the buffer is short.
+        case starved
+        /// The smoothed level sat past `reanchorErrorMs` for
+        /// `reanchorHoldSeconds`.
+        case error
+        /// The playout target itself moved; the level has to jump because a
+        /// ±200 ppm trim would take minutes to walk it there.
+        case target
+    }
+
+    public enum Outcome: Equatable, Sendable {
+        case tracking
+        case reanchorNeeded(ClockFollowLoop.ReanchorReason)
+    }
 
     public let tuning: Tuning
     /// Current `outFrames / inFrames` trim handed to the resampler.
     public private(set) var ratio: Double = 1.0
-    /// EMA-smoothed ring fill, in frames (NaN before the first update).
+    /// EMA-smoothed ring fill, in frames (NaN before the first update). This
+    /// is the fast one, and it is what `stats` reports.
     public private(set) var filteredFillFrames: Double = .nan
+    /// The slower EMA the PI loop and the re-anchor thresholds run on.
+    public private(set) var controlFillFrames: Double = .nan
+    /// Render blocks in a row that found the ring empty.
+    public private(set) var consecutiveStarvedBlocks: Int = 0
+    /// How long the smoothed error has been past `reanchorErrorMs`, seconds.
+    public private(set) var errorHoldSeconds: Double = 0
     private var integrator: Double = 0
 
     public init(tuning: Tuning = Tuning()) { self.tuning = tuning }
@@ -101,6 +168,16 @@ public struct ClockFollowLoop: Sendable {
         integrator = 0
         ratio = 1.0
         filteredFillFrames = fillFrames ?? .nan
+        controlFillFrames = fillFrames ?? .nan
+        consecutiveStarvedBlocks = 0
+        errorHoldSeconds = 0
+    }
+
+    /// Smoothed level error against `targetFrames`, in milliseconds. For the
+    /// log line that explains a re-anchor.
+    public func errorMilliseconds(targetFrames: Double) -> Double {
+        guard !controlFillFrames.isNaN else { return 0 }
+        return (controlFillFrames - targetFrames) / tuning.sampleRate * 1000
     }
 
     /// Advance the controller by `dt` seconds.
@@ -114,18 +191,46 @@ public struct ClockFollowLoop: Sendable {
         guard dt > 0 else { return .tracking }
         if filteredFillFrames.isNaN {
             filteredFillFrames = fillFrames
+            controlFillFrames = fillFrames
         } else {
             let alpha = 1 - exp(-dt / max(tuning.fillFilterSeconds, 1e-6))
             filteredFillFrames += alpha * (fillFrames - filteredFillFrames)
+            let beta = 1 - exp(-dt / max(tuning.controlFilterSeconds, 1e-6))
+            controlFillFrames += beta * (fillFrames - controlFillFrames)
         }
-        let error = filteredFillFrames - targetFrames
+        let error = controlFillFrames - targetFrames
         let maxRatio = tuning.maxRatioPpm * 1e-6
 
         let reanchorFrames = tuning.reanchorErrorMs / 1000.0 * tuning.sampleRate
-        // A raw fill at or below zero means the read cursor has caught the
-        // write head outright: that is real starvation, and waiting for the
-        // smoothed level to agree would just prolong the silence.
-        if abs(error) > reanchorFrames || fillFrames <= 0 { return .reanchorNeeded }
+        let confirmFrames = tuning.starvationConfirmMs / 1000.0 * tuning.sampleRate
+        // A block is starved when the ring holds less than this callback is
+        // about to consume — `dt · rate` IS the block, so the loop can tell
+        // without being told. (Testing `fill <= 0` instead misses the common
+        // case entirely: a ring holding 200 frames when the callback wants
+        // 512 renders silence for most of the block and reports an underrun,
+        // yet its fill never went negative.)
+        //
+        // A starved block is not a fault on its own. It renders silence and
+        // counts an underrun, and the audio that was a millisecond away then
+        // plays normally. A burst-delivered link empties the ring at the end
+        // of most burst gaps; splicing on that is what makes it click.
+        let blockFrames = dt * tuning.sampleRate
+        if fillFrames < blockFrames {
+            consecutiveStarvedBlocks += 1
+        } else {
+            consecutiveStarvedBlocks = 0
+        }
+        if abs(error) > reanchorFrames {
+            errorHoldSeconds += dt
+        } else {
+            errorHoldSeconds = 0
+        }
+        if consecutiveStarvedBlocks >= tuning.starvedBlockLimit, error < -confirmFrames {
+            return .reanchorNeeded(.starved)
+        }
+        if errorHoldSeconds >= tuning.reanchorHoldSeconds {
+            return .reanchorNeeded(.error)
+        }
 
         // Conditional integration (anti-windup). The actuator saturates at
         // ±200 ppm for anything past ~0.3 ms of level error, and a plain

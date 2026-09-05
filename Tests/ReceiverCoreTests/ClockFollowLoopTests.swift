@@ -44,9 +44,9 @@ final class ClockFollowLoopTests: XCTestCase {
         return (ratios, fills)
     }
 
-    func testConvergesOnPositiveHundredPPMWithinTenSeconds() {
+    func testConvergesOnPositiveHundredPPMWithinTwentyFiveSeconds() {
         var loop = ClockFollowLoop()
-        let result = simulate(mismatchPpm: 100, seconds: 10, loop: &loop)
+        let result = simulate(mismatchPpm: 100, seconds: 25, loop: &loop)
         // Steady state is ratio = 1/(1 + m) ≈ 1 − 100 ppm.
         let expected = 1.0 / (1 + 100e-6)
         XCTAssertEqual(loop.ratio, expected, accuracy: 10e-6,
@@ -55,9 +55,9 @@ final class ClockFollowLoopTests: XCTestCase {
         XCTAssertEqual(result.fills.last!, targetFrames, accuracy: 0.002 * rate)
     }
 
-    func testConvergesOnNegativeHundredPPMWithinTenSeconds() {
+    func testConvergesOnNegativeHundredPPMWithinTwentyFiveSeconds() {
         var loop = ClockFollowLoop()
-        _ = simulate(mismatchPpm: -100, seconds: 10, loop: &loop)
+        _ = simulate(mismatchPpm: -100, seconds: 25, loop: &loop)
         XCTAssertEqual(loop.ratio, 1.0 / (1 - 100e-6), accuracy: 10e-6)
     }
 
@@ -73,7 +73,7 @@ final class ClockFollowLoopTests: XCTestCase {
 
     func testSlewRateStaysInaudible() {
         var loop = ClockFollowLoop()
-        let result = simulate(mismatchPpm: 100, seconds: 10, loop: &loop)
+        let result = simulate(mismatchPpm: 100, seconds: 25, loop: &loop)
         var worstStep = 0.0
         for i in 1..<result.ratios.count {
             worstStep = max(worstStep, abs(result.ratios[i] - result.ratios[i - 1]))
@@ -97,19 +97,84 @@ final class ClockFollowLoopTests: XCTestCase {
         XCTAssertLessThanOrEqual(tail.map { abs($0 - 1) }.max()!, 200e-6 + 1e-12)
     }
 
-    func testRequestsReanchorBeyondTwentyMilliseconds() {
+    func testAPersistentLevelErrorReanchorsAndATransientOneDoesNot() {
+        // The level jumps 21 ms past the setpoint and stays there. The loop
+        // must NOT splice on the first tick that sees it — a burst of late
+        // packets looks exactly like this for a moment — but must give up
+        // once the error has proved itself.
         var loop = ClockFollowLoop()
-        let outcome = loop.update(fillFrames: targetFrames + 0.021 * rate,
-                                  targetFrames: targetFrames, dt: 0.01)
-        XCTAssertEqual(outcome, .reanchorNeeded)
-        var ok = ClockFollowLoop()
-        XCTAssertEqual(ok.update(fillFrames: targetFrames + 0.019 * rate,
-                                 targetFrames: targetFrames, dt: 0.01), .tracking)
+        let far = targetFrames + 0.030 * rate
+        var outcome = loop.update(fillFrames: far, targetFrames: targetFrames, dt: 0.01)
+        XCTAssertEqual(outcome, .tracking, "one tick past the threshold is not a fault")
+        var elapsed = 0.01
+        var fired = false
+        for _ in 0..<200 {
+            outcome = loop.update(fillFrames: far, targetFrames: targetFrames, dt: 0.01)
+            elapsed += 0.01
+            if outcome == .reanchorNeeded(.error) { fired = true; break }
+        }
+        XCTAssertTrue(fired, "a level error that never goes away must eventually re-anchor")
+        XCTAssertGreaterThanOrEqual(elapsed, ClockFollowLoop.Tuning().reanchorHoldSeconds)
+
+        // A single spike, then back: never a splice.
+        var transient = ClockFollowLoop()
+        for step in 0..<200 {
+            let fill = step == 100 ? targetFrames + 0.100 * rate : targetFrames
+            XCTAssertEqual(
+                transient.update(fillFrames: fill, targetFrames: targetFrames, dt: 0.01),
+                .tracking,
+                "a one-tick spike must not re-anchor")
+        }
+    }
+
+    func testASingleEmptyRenderIsNotAReanchor() {
+        // The exact field symptom: one render block finds the ring empty
+        // because a packet is a millisecond away. Zero-fill and count an
+        // underrun — do not splice.
+        var loop = ClockFollowLoop()
+        for _ in 0..<400 {
+            loop.update(fillFrames: targetFrames, targetFrames: targetFrames, dt: 0.01)
+        }
+        XCTAssertEqual(loop.update(fillFrames: 0, targetFrames: targetFrames, dt: 0.01), .tracking)
+        XCTAssertEqual(loop.update(fillFrames: targetFrames, targetFrames: targetFrames, dt: 0.01),
+                       .tracking)
+        XCTAssertEqual(loop.consecutiveStarvedBlocks, 0)
+    }
+
+    func testSustainedStarvationDoesReanchor() {
+        // The sender stopped: the ring stays empty and the smoothed level
+        // walks down with it. That is a real fault and must be spliced.
+        var loop = ClockFollowLoop()
+        for _ in 0..<400 {
+            loop.update(fillFrames: targetFrames, targetFrames: targetFrames, dt: 0.01)
+        }
+        var fired = false
+        for _ in 0..<400 {
+            if loop.update(fillFrames: -240, targetFrames: targetFrames, dt: 0.01)
+                == .reanchorNeeded(.starved) {
+                fired = true
+                break
+            }
+        }
+        XCTAssertTrue(fired, "a ring that stays empty must re-anchor")
+    }
+
+    func testAStarvedBlockWithAHealthySmoothedLevelIsNotAFault() {
+        // Burst delivery: the ring empties at the end of every gap and is
+        // full again a moment later. Two starved blocks in a row happen, but
+        // the smoothed level says the buffer is fine, so nothing is spliced.
+        var loop = ClockFollowLoop()
+        for _ in 0..<400 {
+            loop.update(fillFrames: targetFrames, targetFrames: targetFrames, dt: 0.01)
+        }
+        XCTAssertEqual(loop.update(fillFrames: 0, targetFrames: targetFrames, dt: 0.01), .tracking)
+        XCTAssertEqual(loop.update(fillFrames: 0, targetFrames: targetFrames, dt: 0.01), .tracking)
+        XCTAssertEqual(loop.consecutiveStarvedBlocks, 2)
     }
 
     func testResetClearsWindup() {
         var loop = ClockFollowLoop()
-        _ = simulate(mismatchPpm: 100, seconds: 10, loop: &loop)
+        _ = simulate(mismatchPpm: 100, seconds: 25, loop: &loop)
         XCTAssertNotEqual(loop.ratio, 1.0)
         loop.reset(fillFrames: targetFrames)
         XCTAssertEqual(loop.ratio, 1.0)
