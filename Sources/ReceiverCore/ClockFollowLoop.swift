@@ -18,15 +18,15 @@ import Foundation
 /// ```
 /// ωn = √(R·Ki)          2ζωn = R·Kp
 /// ```
-/// The defaults place `ωn = 0.2 rad/s`, `ζ = 1.6` — overdamped, within a few
-/// ppm of the right trim after about five seconds, so a fresh ±100 ppm
-/// crystal error is tracked out well inside ten seconds while the correction
-/// itself only ever moves at a few hundred ppm per second (an inaudible
-/// pitch sweep).
+/// The defaults place `ωn = 0.3 rad/s`, `ζ = 1.2` — overdamped, poles at
+/// −0.74 and −0.12 rad/s, so a ±100 ppm crystal error is tracked to within a
+/// few ppm inside ten seconds and a cold start settles fully in under a
+/// minute, while the correction itself only ever moves at a few hundred ppm
+/// per second (an inaudible pitch sweep).
 ///
 /// The bandwidth is deliberately no higher than that: `Kp` multiplies the
 /// measurement noise straight into the pitch, and the level measurement is
-/// only as clean as the network. At `Kp = 1.3e-5` a residual ±3 frames of
+/// only as clean as the network. At `Kp = 1.5e-5` a residual ±3 frames of
 /// level noise is ±40 ppm of trim — inaudible. Ten times the bandwidth would
 /// track a crystal in half a second and wobble the pitch by the full ±200 ppm
 /// clamp on any jittery link, which is the wrong trade for a music path.
@@ -36,15 +36,14 @@ import Foundation
 ///    more than any real crystal pair needs.
 ///  * `|Δu|` is slew-limited per second so a step in the level (a burst of
 ///    late packets) cannot jerk the pitch.
-///  * The measured fill goes through a **peak-hold with slow decay** and then
-///    an EMA (τ = 1.5 s) before it reaches the controller. Peak-hold is the right filter
-///    here because the noise is one-sided: the sender's `play_at_ns` stamps
-///    are perfectly regular, so `writeEnd` can only ever be LATE, never
-///    early. Taking the running maximum recovers the true level as soon as
-///    any packet in the window arrives promptly, with no bias — unlike an
-///    average, which would sit permanently below the truth on a jittery
-///    link. The decay (a few ms of level per second, two orders above any
-///    real crystal drift) lets a genuine drop follow through.
+///  * The measured fill goes through an EMA (τ = 1.5 s) before it reaches
+///    the controller. The raw number carries two sawtooths — the write head
+///    steps by a whole 240-frame packet 200 times a second, and the read
+///    cursor drops by a whole IO buffer every callback — plus whatever the
+///    network adds. Averaging is the right filter for that: the mean of a
+///    sawtooth is the true level. (A peak-hold, which is tempting because
+///    delivery jitter is one-sided, latches the TOP of those sawtooths
+///    instead and biases the level by the best part of 20 ms.)
 ///  * Beyond ±20 ms of level error the loop reports `.reanchorNeeded`: no
 ///    ±200 ppm trim can walk that back in reasonable time, so the caller
 ///    jumps the read cursor instead (an audible splice, but only on a real
@@ -62,21 +61,17 @@ public struct ClockFollowLoop: Sendable {
         public var slewPpmPerSecond: Double
         /// Time constant of the fill EMA, seconds.
         public var fillFilterSeconds: Double
-        /// How fast the peak-hold stage is allowed to follow a falling level,
-        /// in frames per second.
-        public var peakDecayFramesPerSecond: Double
         /// Level error beyond which the caller must hard re-anchor, in ms.
         public var reanchorErrorMs: Double
         /// Nominal device rate, used for the ms ↔ frames conversions.
         public var sampleRate: Double
 
         public init(sampleRate: Double = WireFormat.sampleRate,
-                    naturalFrequency: Double = 0.2,
-                    dampingRatio: Double = 1.6,
+                    naturalFrequency: Double = 0.3,
+                    dampingRatio: Double = 1.2,
                     maxRatioPpm: Double = 200,
                     slewPpmPerSecond: Double = 400,
                     fillFilterSeconds: Double = 1.5,
-                    peakDecayFramesPerSecond: Double = 20,
                     reanchorErrorMs: Double = 20) {
             precondition(sampleRate > 0)
             self.sampleRate = sampleRate
@@ -85,7 +80,6 @@ public struct ClockFollowLoop: Sendable {
             self.maxRatioPpm = maxRatioPpm
             self.slewPpmPerSecond = slewPpmPerSecond
             self.fillFilterSeconds = fillFilterSeconds
-            self.peakDecayFramesPerSecond = peakDecayFramesPerSecond
             self.reanchorErrorMs = reanchorErrorMs
         }
     }
@@ -97,8 +91,6 @@ public struct ClockFollowLoop: Sendable {
     public private(set) var ratio: Double = 1.0
     /// EMA-smoothed ring fill, in frames (NaN before the first update).
     public private(set) var filteredFillFrames: Double = .nan
-    /// Peak-hold stage feeding the EMA.
-    public private(set) var peakFillFrames: Double = .nan
     private var integrator: Double = 0
 
     public init(tuning: Tuning = Tuning()) { self.tuning = tuning }
@@ -109,7 +101,6 @@ public struct ClockFollowLoop: Sendable {
         integrator = 0
         ratio = 1.0
         filteredFillFrames = fillFrames ?? .nan
-        peakFillFrames = fillFrames ?? .nan
     }
 
     /// Advance the controller by `dt` seconds.
@@ -121,16 +112,11 @@ public struct ClockFollowLoop: Sendable {
     @discardableResult
     public mutating func update(fillFrames: Double, targetFrames: Double, dt: Double) -> Outcome {
         guard dt > 0 else { return .tracking }
-        if peakFillFrames.isNaN {
-            peakFillFrames = fillFrames
-        } else {
-            peakFillFrames = max(fillFrames, peakFillFrames - tuning.peakDecayFramesPerSecond * dt)
-        }
         if filteredFillFrames.isNaN {
-            filteredFillFrames = peakFillFrames
+            filteredFillFrames = fillFrames
         } else {
             let alpha = 1 - exp(-dt / max(tuning.fillFilterSeconds, 1e-6))
-            filteredFillFrames += alpha * (peakFillFrames - filteredFillFrames)
+            filteredFillFrames += alpha * (fillFrames - filteredFillFrames)
         }
         let error = filteredFillFrames - targetFrames
         let maxRatio = tuning.maxRatioPpm * 1e-6
@@ -141,8 +127,19 @@ public struct ClockFollowLoop: Sendable {
         // smoothed level to agree would just prolong the silence.
         if abs(error) > reanchorFrames || fillFrames <= 0 { return .reanchorNeeded }
 
-        integrator += tuning.ki * error * dt
-        integrator = min(max(integrator, -maxRatio), maxRatio)   // anti-windup
+        // Conditional integration (anti-windup). The actuator saturates at
+        // ±200 ppm for anything past ~0.3 ms of level error, and a plain
+        // clamped integrator would spend that whole excursion winding into
+        // the stop — then take just as long to unwind once the error crossed
+        // zero, which is exactly the slow, overshooting recovery this loop
+        // must not have. So: only integrate when doing so does not push an
+        // already-saturated output further into its stop.
+        let candidate = min(max(integrator + tuning.ki * error * dt, -maxRatio), maxRatio)
+        let uCandidate = -(tuning.kp * error + candidate)
+        let uHeld = -(tuning.kp * error + integrator)
+        if abs(uCandidate) <= maxRatio || abs(uCandidate) < abs(uHeld) {
+            integrator = candidate
+        }
         var u = -(tuning.kp * error + integrator)
         u = min(max(u, -maxRatio), maxRatio)
 

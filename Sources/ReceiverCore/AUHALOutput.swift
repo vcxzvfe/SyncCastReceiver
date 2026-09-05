@@ -121,7 +121,11 @@ public final class AUHALOutput: @unchecked Sendable {
     /// renegotiates its buffer size, e.g. after wake).
     public func refreshLatency() {
         let rate = device.nominalSampleRate > 0 ? device.nominalSampleRate : engine.sampleRate
-        latencyNanos.value = Int64(AudioDevices.outputLatencyNanos(device.id, sampleRate: rate))
+        let nanos = AudioDevices.outputLatencyNanos(device.id, sampleRate: rate)
+        latencyNanos.value = Int64(nanos)
+        // The engine needs it in ITS frames (the client format's rate), not
+        // the device's, because that is what the ring is counted in.
+        engine.setDeviceLatency(frames: Int(Double(nanos) / 1_000_000_000 * engine.sampleRate))
     }
 
     /// Real-time entry point. Runs on the CoreAudio render thread.

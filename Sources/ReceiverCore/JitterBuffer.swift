@@ -256,7 +256,9 @@ public final class JitterBuffer: @unchecked Sendable {
         let cap = capacityFrames
         let start = scr_atomic_load_acquire(readCursor)
         let end = scr_atomic_load_acquire(writeEnd)
-        let lowerValid = max(start, end - Int64(cap))
+        // Frame indices below 0 predate the stream and were never written;
+        // frames older than one ring have been overwritten. Both are silence.
+        let lowerValid = max(0, end - Int64(cap))
         let validStart = max(start, lowerValid)
         let validEnd = min(start &+ Int64(frames), end)
 

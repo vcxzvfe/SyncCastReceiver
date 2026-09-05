@@ -18,6 +18,9 @@ public final class PlayoutEngine: @unchecked Sendable {
         public var counters: JitterBuffer.Counters
         public var clip: Int
         public var reanchors: Int
+        /// EMA-smoothed buffer level, the number worth showing a user.
+        public var levelMilliseconds: Double
+        /// Instantaneous ring fill at the moment of the snapshot.
         public var fillMilliseconds: Double
         public var ratio: Double
         public var isPlaying: Bool
@@ -32,10 +35,12 @@ public final class PlayoutEngine: @unchecked Sendable {
     /// copy the stats thread reads.
     private var loop: ClockFollowLoop
     private let ratioPublished = AtomicDouble(1.0)
+    private let levelPublished = AtomicDouble(.nan)
 
     private let offsetNanosBox = AtomicInt64(0)
     private let offsetValid = AtomicBool(false)
     private let targetFramesBox = AtomicInt64(0)
+    private let deviceLatencyFramesBox = AtomicInt64(0)
     private let softwareGainBox = AtomicDouble(1.0)
     private let mutedBox = AtomicBool(false)
     private let clipBox = AtomicInt64(0)
@@ -117,6 +122,37 @@ public final class PlayoutEngine: @unchecked Sendable {
         Double(targetFramesBox.value) / sampleRate * 1000
     }
 
+    /// Output-device latency in frames (`kAudioDevicePropertyLatency` +
+    /// safety offset + buffer size + stream latency).
+    ///
+    /// It comes straight off the water level: `play_at_ns` is the moment the
+    /// audio must leave the DAC, and the read cursor runs one device latency
+    /// AHEAD of the DAC, so the frames queued behind the cursor in steady
+    /// state are `target − deviceLatency`, not `target`. Setting the loop's
+    /// setpoint to the target itself would ask the buffer to hold audio it
+    /// has not received yet, saturate the trim, and drag playout late.
+    public func setDeviceLatency(frames: Int) {
+        deviceLatencyFramesBox.value = Int64(max(0, frames))
+    }
+
+    /// The PI loop's setpoint: what the ring should hold ahead of the read
+    /// cursor when playout is correctly aligned.
+    ///
+    /// `target − deviceLatency` for the reason above, plus HALF A PACKET:
+    /// the write head only moves in 240-frame steps, so a sample of it taken
+    /// at an arbitrary moment sits on average half a packet above the
+    /// continuous position the sender is really at. Without that term the
+    /// loop would quietly drag playout 2.5 ms early to make the measured
+    /// level match a setpoint the stream can never sit at.
+    ///
+    /// Never below one packet, so a device whose latency exceeds the
+    /// requested target still has something to render from.
+    public var levelSetpointFrames: Int64 {
+        let compensated = targetFramesBox.value - deviceLatencyFramesBox.value
+            + Int64(WireFormat.framesPerPacket / 2)
+        return max(Int64(WireFormat.framesPerPacket), compensated)
+    }
+
     /// Linear amplitude applied in the render path. Left at 1.0 when the
     /// device carries the level in hardware.
     public func setSoftwareGain(_ gain: Double) {
@@ -145,9 +181,11 @@ public final class PlayoutEngine: @unchecked Sendable {
     }
 
     public var snapshot: Snapshot {
-        Snapshot(counters: buffer.counterSnapshot,
+        let level = levelPublished.value
+        return Snapshot(counters: buffer.counterSnapshot,
                  clip: Int(clipBox.value),
                  reanchors: Int(reanchorBox.value),
+                 levelMilliseconds: level.isNaN ? buffer.fillMilliseconds : level / sampleRate * 1000,
                  fillMilliseconds: buffer.fillMilliseconds,
                  ratio: ratioPublished.value,
                  isPlaying: playingBox.value)
@@ -177,7 +215,7 @@ public final class PlayoutEngine: @unchecked Sendable {
             return
         }
 
-        let targetFrames = targetFramesBox.value
+        let targetFrames = levelSetpointFrames
         if !anchoredBox.value {
             // Map the DAC deadline into the sender's clock and start playing
             // exactly the frame that was stamped for it.
@@ -202,6 +240,7 @@ public final class PlayoutEngine: @unchecked Sendable {
         }
         let ratio = loop.ratio
         ratioPublished.value = ratio
+        levelPublished.value = loop.filteredFillFrames
 
         var guardCounter = 0
         while stagingCount < frames && guardCounter < 8 {
