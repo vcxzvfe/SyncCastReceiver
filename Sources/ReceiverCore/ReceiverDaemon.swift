@@ -405,6 +405,7 @@ public final class ReceiverDaemon: @unchecked Sendable {
         engine.setMuted(false)
         engine.startStream()
         streaming = true
+        StreamingMarker.touch()
 
         let ack = HelloAckMessage(udpPort: Int(audioSocket.boundPort),
                                   device: device.name,
@@ -481,6 +482,7 @@ public final class ReceiverDaemon: @unchecked Sendable {
     private func stopStreaming(reason: String) {
         guard streaming else { return }
         streaming = false
+        StreamingMarker.remove()
         // Stop defending a level nobody is driving any more: with no sender,
         // the device belongs entirely to whoever else is using this Mac.
         volumeObserver?.stop()
@@ -510,6 +512,7 @@ public final class ReceiverDaemon: @unchecked Sendable {
 
     private func emitStats() {
         guard streaming else { return }
+        StreamingMarker.touch()
         applyTargetLatency(force: false)
         let snapshot = engine.snapshot
         let message = StatsMessage(late: snapshot.counters.late,

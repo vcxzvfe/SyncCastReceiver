@@ -262,8 +262,11 @@ blackouts and no playout target under ~150 ms survives it. `ifconfig awdl0 |
 grep status` says whether it is active; macOS re-enables it on a login, an
 AirDrop window or a nearby Mac's Universal Control, so
 `sudo scripts/awdl-guard.sh install` puts a root LaunchDaemon in place that
-keeps it down (and disables AirDrop / Universal Control on that Mac until
-`uninstall`).
+keeps it down — only while a stream is playing. The daemon touches
+`/tmp/io.syncast.receiver.streaming` once a second during a stream and
+removes it when the stream stops; the guard acts only while that marker is
+under 10 s old, so AirDrop and Universal Control work normally whenever
+nothing is playing, and a crashed daemon cannot leave the radio pinned.
 
 ## Silence
 

@@ -8,11 +8,11 @@
 # no playout target below ~150 ms survives it. macOS brings awdl0 back up
 # whenever something asks for it (a login, a Finder AirDrop window, Universal
 # Control on a nearby Mac), so `ifconfig awdl0 down` alone lasts minutes to
-# hours. This installs a root LaunchDaemon that re-applies it every 5 s.
-#
-# Side effect: AirDrop / Universal Control / Sidecar / Continuity Camera
-# stop working on THIS Mac while the guard is installed. Uninstall to get
-# them back.
+# hours. This installs a root LaunchDaemon that re-applies it every second —
+# but ONLY while the receiver is playing a stream (it publishes a marker file,
+# see StreamingMarker.swift). When nothing is playing the radio is left alone,
+# so AirDrop / Universal Control / Sidecar keep working on this Mac; they are
+# unavailable only for the minutes a stream is actually running.
 #
 #   sudo scripts/awdl-guard.sh install
 #   sudo scripts/awdl-guard.sh uninstall
@@ -25,6 +25,11 @@ BIN="/usr/local/libexec/synccast-awdl-guard"
 
 status() {
   printf 'awdl0: %s\n' "$(ifconfig awdl0 2>/dev/null | awk '/status:/ {print $2}')"
+  if [ -f /tmp/io.syncast.receiver.streaming ]; then
+    echo "receiver: streaming (marker present)"
+  else
+    echo "receiver: not streaming"
+  fi
   if launchctl print "system/${LABEL}" >/dev/null 2>&1; then
     echo "guard: installed and loaded (${PLIST})"
   else
@@ -44,12 +49,22 @@ install() {
   mkdir -p "$(dirname "$BIN")"
   cat > "$BIN" <<'GUARD'
 #!/bin/bash
-# Re-applied every 5 s by launchd (see io.syncast.awdl-guard.plist).
+# Runs as root under launchd (io.syncast.awdl-guard). Keeps awdl0 down ONLY
+# while the receiver says a stream is playing: it touches
+# /tmp/io.syncast.receiver.streaming once a second while streaming and removes
+# it when the stream stops (StreamingMarker.swift). A marker older than 10 s is
+# stale (the daemon died), and the radio is left alone. When nothing is playing
+# nothing is touched, so AirDrop / Universal Control work as usual — macOS
+# brings awdl0 back up by itself the moment something asks for it.
+MARKER=/tmp/io.syncast.receiver.streaming
 while true; do
-  if ifconfig awdl0 2>/dev/null | grep -q 'status: active'; then
-    ifconfig awdl0 down 2>/dev/null || true
+  if [ -f "$MARKER" ]; then
+    age=$(( $(date +%s) - $(stat -f %m "$MARKER" 2>/dev/null || echo 0) ))
+    if [ "$age" -lt 10 ] && ifconfig awdl0 2>/dev/null | grep -q 'status: active'; then
+      ifconfig awdl0 down 2>/dev/null || true
+    fi
   fi
-  sleep 5
+  sleep 1
 done
 GUARD
   chmod 755 "$BIN"
