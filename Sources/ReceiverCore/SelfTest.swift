@@ -35,22 +35,35 @@ public enum SelfTest {
     ///
     /// Shared by every scenario so they all exercise the same path; only the
     /// delivery SCHEDULE differs between them.
+    /// - Parameters:
+    ///   - index: the packet's slot on the sender's timeline; it decides
+    ///     `play_at_ns`.
+    ///   - payloadIndex: which audio to put in it, when that must differ from
+    ///     `index`. Only the overlapping-timeline scenario uses it — a packet
+    ///     carrying the WRONG audio for the slot it claims is the whole point
+    ///     there, because identical audio would sound fine even if the guard
+    ///     failed.
+    ///   - seq: sequence number, when the default (derived from `index`)
+    ///     would be caught by the duplicate filter.
     @discardableResult
     static func encodeParseIngest(index: Int,
                                   senderStart: UInt64,
                                   packetNanos: Double,
                                   arrivalNanos: UInt64,
                                   scratch: inout [Int16],
-                                  engine: PlayoutEngine) -> Bool {
+                                  engine: PlayoutEngine,
+                                  payloadIndex: Int? = nil,
+                                  seq: UInt32? = nil) -> Bool {
         var samples = [Int16](repeating: 0, count: WireFormat.framesPerPacket * WireFormat.channelCount)
+        let audioIndex = payloadIndex ?? index
         for f in 0..<WireFormat.framesPerPacket {
-            let v = sample(atFrame: index * WireFormat.framesPerPacket + f)
+            let v = sample(atFrame: audioIndex * WireFormat.framesPerPacket + f)
             let s = Int16(max(-32_767, min(32_767, (v * 32_767).rounded())))
             samples[f * 2] = s
             samples[f * 2 + 1] = s
         }
         let header = AudioPacketHeader(streamID: 0x5157_3A01,
-                                       seq: UInt32(truncatingIfNeeded: index),
+                                       seq: seq ?? UInt32(truncatingIfNeeded: index),
                                        playAtNanos: senderStart &+ UInt64((Double(index) * packetNanos).rounded()),
                                        frames: UInt32(WireFormat.framesPerPacket))
         let bytes = buildAudioPacket(header: header, samples: samples)

@@ -98,6 +98,19 @@ public struct ClockFollowLoop: Sendable {
         /// How far below the setpoint the SMOOTHED level must sit before a
         /// run of empty blocks is believed, in ms.
         public var starvationConfirmMs: Double
+        /// Whether a starvation splice may fire on a render block that
+        /// brought no new audio at all.
+        ///
+        /// False, and the reason is the second half of the same argument as
+        /// `starvedBlockLimit`: if nothing has arrived since the previous
+        /// block, delivery has stopped, and re-anchoring lands the cursor on
+        /// the same empty ring while throwing away loop state that was
+        /// tracking the sender's clock correctly. A pause — the programme
+        /// stopping, a Wi-Fi scan — is exactly that shape.
+        ///
+        /// It is a knob only so the self-test can turn the guard OFF and
+        /// prove its scenarios still have teeth without it.
+        public var spliceWithoutNewAudio: Bool
         /// Nominal device rate, used for the ms ↔ frames conversions.
         public var sampleRate: Double
 
@@ -111,7 +124,8 @@ public struct ClockFollowLoop: Sendable {
                     reanchorErrorMs: Double = 20,
                     reanchorHoldSeconds: Double = 0.5,
                     starvedBlockLimit: Int = 2,
-                    starvationConfirmMs: Double = 10) {
+                    starvationConfirmMs: Double = 10,
+                    spliceWithoutNewAudio: Bool = false) {
             precondition(sampleRate > 0)
             self.sampleRate = sampleRate
             self.ki = naturalFrequency * naturalFrequency / sampleRate
@@ -124,6 +138,7 @@ public struct ClockFollowLoop: Sendable {
             self.reanchorHoldSeconds = reanchorHoldSeconds
             self.starvedBlockLimit = max(1, starvedBlockLimit)
             self.starvationConfirmMs = starvationConfirmMs
+            self.spliceWithoutNewAudio = spliceWithoutNewAudio
         }
     }
 

@@ -24,13 +24,20 @@ case .help:
 case .selfTest:
     // No config, no network, no CoreAudio: this must work on a machine with
     // no audio hardware at all.
-    // Two links, because they fail differently: a steady one (a wired LAN)
-    // and a bursty one (Wi-Fi, where the receiver used to splice several
-    // times a second).
+    // Four scenarios, because they fail differently: a steady link (a wired
+    // LAN), a bursty one (Wi-Fi, where the receiver used to splice several
+    // times a second), a sender that pauses, and a sender stamping two
+    // timelines at once.
     let steady = SelfTest.run { print($0) }
     print("")
     let bursty = SelfTest.runBurstyArrival { print($0) }
-    let checks = steady.checks + bursty.checks
+    print("")
+    // And two about the SENDER rather than the network: a programme that
+    // pauses, and a sender stamping two timelines at once.
+    let idle = SelfTest.runIdleResume { print($0) }
+    print("")
+    let overlapping = SelfTest.runOverlappingTimeline { print($0) }
+    let checks = steady.checks + bursty.checks + idle.checks + overlapping.checks
     if checks.allSatisfy(\.passed) {
         print("SELFTEST PASS")
         exit(0)

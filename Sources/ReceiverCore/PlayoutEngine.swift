@@ -121,6 +121,11 @@ public final class PlayoutEngine: @unchecked Sendable {
     private let stagingWriteHeads: UnsafeMutablePointer<UnsafeMutablePointer<Float>>
     private var stagingCount = 0
     private var smoothedGain: Float = 1.0
+    /// `writeEnd` as of the previous render block. Render-thread only, like
+    /// `stagingCount`. Used to tell "the ring is dry because delivery
+    /// stopped" from "the ring is dry because we are draining it faster than
+    /// it fills" — only the second is a fault a splice can fix.
+    private var lastRenderWriteEnd: Int64 = .min
 
     public init(channelCount: Int = WireFormat.channelCount,
                 sampleRate: Double = WireFormat.sampleRate,
@@ -404,6 +409,7 @@ public final class PlayoutEngine: @unchecked Sendable {
             resampler.reset()
             loop.reset(fillFrames: Double(buffer.fillFrames))
             stagingCount = 0
+            lastRenderWriteEnd = buffer.writeEndFrame
             anchoredBox.value = true
             // The cold-start anchor already put the cursor where the new
             // target says; there is nothing left for a target jump to do.
@@ -417,6 +423,19 @@ public final class PlayoutEngine: @unchecked Sendable {
                                   dt: dt)
         var reanchorReason: ClockFollowLoop.ReanchorReason?
         if case .reanchorNeeded(let reason) = outcome { reanchorReason = reason }
+        // Starvation with nothing arriving is not a fault a splice can fix.
+        // Delivery has stopped — during the half second before an outright
+        // pause is recognised, say — and re-anchoring lands the cursor on the
+        // same empty ring, having thrown away the loop state that was
+        // tracking the sender's clock correctly. Zero-fill and wait instead;
+        // if the ring really is being drained faster than it fills, the next
+        // block that DOES bring audio will say so again.
+        let writeEndNow = buffer.writeEndFrame
+        let ringAdvanced = writeEndNow > lastRenderWriteEnd
+        lastRenderWriteEnd = writeEndNow
+        if reanchorReason == .starved, !ringAdvanced, !loop.tuning.spliceWithoutNewAudio {
+            reanchorReason = nil
+        }
         if targetMovedBox.value {
             targetMovedBox.value = false
             reanchorReason = .target
@@ -428,6 +447,7 @@ public final class PlayoutEngine: @unchecked Sendable {
             resampler.reset()
             loop.reset(fillFrames: Double(targetFrames))
             stagingCount = 0
+            lastRenderWriteEnd = buffer.writeEndFrame
             reanchorBox.add(1)
             switch reason {
             case .starved: reanchorStarvedBox.add(1)
