@@ -459,6 +459,10 @@ public final class PlayoutEngine: @unchecked Sendable {
             let errorMs = loop.errorMilliseconds(targetFrames: Double(targetFrames))
             let starved = loop.consecutiveStarvedBlocks
             buffer.reanchorReadCursor(toLevelFrames: targetFrames)
+            // A splice puts the level back on the setpoint by construction; the
+            // loop's integrator and filtered levels describe the OLD excursion
+            // and would drive the fresh level straight back off it. Start over.
+            loop.reset(fillFrames: Double(targetFrames))
             resampler.reset()
             loop.reset(fillFrames: Double(targetFrames))
             stagingCount = 0
