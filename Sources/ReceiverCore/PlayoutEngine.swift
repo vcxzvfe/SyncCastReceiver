@@ -359,7 +359,13 @@ public final class PlayoutEngine: @unchecked Sendable {
         let outcome = buffer.ingest(header: header, samples: samples)
         switch outcome {
         case .accepted, .reordered, .restarted:
-            arrivalTracker.record(playAtNanos: header.playAtNanos, arrivalNanos: arrivalNanos)
+            // Compare like with like: the packet's play time mapped into THIS
+            // clock (`local = sender + offset`), otherwise the slack figures
+            // carry the raw inter-machine clock difference.
+            if offsetValid.value {
+                let localPlayAt = UInt64(bitPattern: Int64(bitPattern: header.playAtNanos) &+ offsetNanosBox.value)
+                arrivalTracker.record(playAtNanos: localPlayAt, arrivalNanos: arrivalNanos)
+            }
         case .late, .duplicate, .overlap, .farFuture:
             // A duplicate says nothing new about the link, a late packet's
             // delay is already past the point the buffer could have used it,
