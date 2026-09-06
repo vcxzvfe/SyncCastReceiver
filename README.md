@@ -132,8 +132,9 @@ substring of the name shown in System Settings → Sound.
 .build/release/synccast-receiver --selftest
 ```
 
-Runs two simulated links through the **real** packet parser, jitter buffer,
-clock loop and resampler, with no network and no audio hardware.
+Runs four simulated links through the **real** packet parser, jitter buffer,
+clock loop and resampler, with no network and no audio hardware. The first two
+are about the NETWORK; the last two are about the SENDER.
 
 1. **Steady** — 70 s of a wired-LAN-shaped stream (one packet every 5 ms) with
    injected loss, duplication and reordering, and a device clock 100 ppm fast.
@@ -147,6 +148,17 @@ clock loop and resampler, with no network and no audio hardware.
    against the stalls that were injected. Burst delivery empties the ring for
    a block at the end of most gaps; a receiver that treats that as starvation
    splices — and clicks — several times a second.
+3. **Sender idles then resumes** — steady delivery, two seconds of nothing at
+   all, then delivery again two seconds further along the sender's timeline.
+   A programme that stops is silence, not starvation: once the pause is
+   recognised no more underruns are counted, the resume is one silent
+   re-anchor rather than a splice, and the level and alignment come back
+   exactly where they were.
+4. **Overlapping timeline** — a well-behaved stream with a second one
+   interleaved into it, claiming slots the ring already holds and carrying
+   different audio. Every one is counted as `overlap` and none of it reaches
+   the DAC: same output level, same alignment, no splices. This is the shape
+   of a real sender fault, heard as two copies of the music at once.
 
 It prints `SELFTEST PASS` and exits 0 when everything holds. It takes a few
 seconds of CPU and works on a machine with no audio devices at all.
@@ -176,7 +188,16 @@ a second, while a stream is running, the daemon logs and sends the sender a
 `stats` line: late, lost, underrun and clip counts, the buffer level in
 milliseconds, the current trim, the number of hard re-anchors split by cause
 (`reanchor_starved` / `reanchor_error`), the link's measured p95 arrival
-jitter, and the target it is actually running at.
+jitter, the target it is actually running at, and the packets it had to refuse
+(`overlap` / `far_future`).
+
+Those last two are about the SENDER, not about the link. `overlap` counts
+packets whose frames overlapped audio already buffered — a correct sender
+cannot produce one, because every packet comes from a distinct span of its
+capture ring, so a non-zero count means it is stamping more than one timeline.
+`far_future` counts play times more than two seconds past the newest buffered
+frame. Both are refused rather than written, and both get their own WARN line
+(rate limited to one a second) saying which side the fault is on.
 
 Every hard re-anchor also gets its own INFO line saying why it happened and
 with what numbers (level error, ring fill, consecutive starved blocks), rate
@@ -204,6 +225,21 @@ The counters tell you which side of the line you are on. `underrun` counts
 render blocks that ran dry: some are unavoidable on a link that stalls, and
 they cost a few milliseconds of silence each. `reanchor_*` is the one to
 watch — a re-anchor is a splice, and a healthy link has none.
+
+## Silence
+
+A sender with nothing to play sends nothing. After half a second without a
+packet the receiver treats the link as **idle** rather than starved: it
+renders silence, stops counting underruns, leaves the clock loop alone and
+does not re-anchor. The first packet back resets the stream and re-anchors
+once, silently, primed to the target — so a paused programme costs no click on
+resume, and the audio that comes back is not measured against a schedule that
+stopped seconds ago.
+
+The same reasoning applies for shorter gaps: a starvation splice is suppressed
+on any render block that brought no new audio at all. Delivery has stopped, so
+re-anchoring would land the cursor on the same empty ring having thrown away
+loop state that was tracking the sender's clock correctly.
 
 ## Behaviour under load, sleep and faults
 
