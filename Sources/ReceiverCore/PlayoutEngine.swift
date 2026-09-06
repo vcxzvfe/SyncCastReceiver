@@ -32,6 +32,8 @@ public final class PlayoutEngine: @unchecked Sendable {
         public var p95JitterMilliseconds: Double?
         /// Smallest and 5th-percentile arrival slack over the window, ms.
         public var slackMilliseconds: (minimum: Double, p05: Double)?
+        /// p95 / max gap between consecutive arrivals, ms.
+        public var arrivalGapMilliseconds: (p95: Double, maximum: Double)?
         public var ratio: Double
         public var isPlaying: Bool
         /// Render blocks rendered as silence because the link was idle. Not
@@ -289,6 +291,7 @@ public final class PlayoutEngine: @unchecked Sendable {
                  fillMilliseconds: buffer.fillMilliseconds,
                  p95JitterMilliseconds: arrivalTracker.p95SpreadMilliseconds,
                  slackMilliseconds: arrivalTracker.slackMilliseconds,
+                 arrivalGapMilliseconds: arrivalTracker.arrivalGapMilliseconds,
                  ratio: ratioPublished.value,
                  isPlaying: playingBox.value,
                  idleBlocks: Int(idleBlockBox.value),

@@ -43,12 +43,19 @@ public final class PacketArrivalTracker: @unchecked Sendable {
 
     private let lock = NSLock()
     private var deltas: [Int64]
+    /// Gaps between consecutive arrivals (ns), independent of any schedule —
+    /// pure receive-path pacing. Same ring geometry as `deltas`.
+    private var gaps: [Int64]
+    private var gapCount: Int = 0
+    private var gapNext: Int = 0
+    private var lastArrival: UInt64 = 0
     private var count: Int = 0
     private var next: Int = 0
 
     public init(windowSize: Int = PacketArrivalTracker.windowSize) {
         let size = max(8, windowSize)
         self.deltas = [Int64](repeating: 0, count: size)
+        self.gaps = [Int64](repeating: 0, count: size)
     }
 
     /// One accepted packet. Both timestamps are monotonic nanoseconds, from
@@ -59,6 +66,12 @@ public final class PacketArrivalTracker: @unchecked Sendable {
         deltas[next] = delta
         next = (next + 1) % deltas.count
         if count < deltas.count { count += 1 }
+        if lastArrival != 0 {
+            gaps[gapNext] = Int64(bitPattern: arrivalNanos &- lastArrival)
+            gapNext = (gapNext + 1) % gaps.count
+            if gapCount < gaps.count { gapCount += 1 }
+        }
+        lastArrival = arrivalNanos
         lock.unlock()
     }
 
@@ -66,7 +79,25 @@ public final class PacketArrivalTracker: @unchecked Sendable {
         lock.lock()
         count = 0
         next = 0
+        gapCount = 0
+        gapNext = 0
+        lastArrival = 0
         lock.unlock()
+    }
+
+    /// p95 and maximum gap between consecutive packet arrivals, ms. With a
+    /// 5 ms packet cadence a clean link sits near 5 / 10; a receive path that
+    /// stalls shows up here as a max in the tens of ms even when the network
+    /// itself is smooth.
+    public var arrivalGapMilliseconds: (p95: Double, maximum: Double)? {
+        lock.lock()
+        let filled = gapCount
+        guard filled >= 8 else { lock.unlock(); return nil }
+        var window = Array(gaps[0..<filled])
+        lock.unlock()
+        window.sort()
+        let index = min(filled - 1, Int((Double(filled - 1) * 0.95).rounded()))
+        return (Double(window[index]) / 1_000_000, Double(window[filled - 1]) / 1_000_000)
     }
 
     /// `p95 − min` of the window, in milliseconds, or nil until the window

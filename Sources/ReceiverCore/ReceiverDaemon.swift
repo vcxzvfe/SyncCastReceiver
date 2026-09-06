@@ -495,6 +495,7 @@ public final class ReceiverDaemon: @unchecked Sendable {
             + "(starved=\(message.reanchorStarved) error=\(message.reanchorError)) "
             + "p95jitter=\(jitter) target=\(String(format: "%.0f", message.targetMs))ms"
             + (snapshot.slackMilliseconds.map { String(format: " slack=min%.1f/p05%.1fms", $0.minimum, $0.p05) } ?? "")
+            + (snapshot.arrivalGapMilliseconds.map { String(format: " gap=p95%.1f/max%.1fms", $0.p95, $0.maximum) } ?? "")
             + (snapshot.isIdle ? " idle" : "")
         lastStatsLine = line
         log.debug("stats \(line)")
