@@ -496,6 +496,7 @@ public final class ReceiverDaemon: @unchecked Sendable {
             + "p95jitter=\(jitter) target=\(String(format: "%.0f", message.targetMs))ms"
             + (snapshot.slackMilliseconds.map { String(format: " slack=min%.1f/p05%.1fms", $0.minimum, $0.p05) } ?? "")
             + (snapshot.arrivalGapMilliseconds.map { String(format: " gap=p95%.1f/max%.1fms", $0.p95, $0.maximum) } ?? "")
+            + (snapshot.maxJitterMilliseconds.map { String(format: " maxjitter=%.1fms", $0) } ?? "")
             + (snapshot.isIdle ? " idle" : "")
         lastStatsLine = line
         log.debug("stats \(line)")
@@ -560,6 +561,7 @@ public final class ReceiverDaemon: @unchecked Sendable {
         let wanted = TargetLatencyPolicy.effectiveMilliseconds(
             requestedMs: requestedTargetMs,
             p95JitterMs: engine.snapshot.p95JitterMilliseconds,
+            maxJitterMs: engine.snapshot.maxJitterMilliseconds,
             blockFrames: blockFrames,
             sampleRate: engine.sampleRate)
         let now = clock.nowNanos()

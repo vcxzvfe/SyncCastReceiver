@@ -41,6 +41,7 @@ public enum TargetLatencyPolicy {
     ///   - sampleRate: the output device's rate.
     public static func effectiveMilliseconds(requestedMs: Double,
                                              p95JitterMs: Double?,
+                                             maxJitterMs: Double? = nil,
                                              blockFrames: Int,
                                              sampleRate: Double) -> Double {
         guard requestedMs.isFinite else { return 0 }
@@ -49,7 +50,16 @@ public enum TargetLatencyPolicy {
             return requestedMs
         }
         let blockMs = Double(blockFrames) / sampleRate * 1000
-        let floorMs = p95JitterMs + Double(blocksOfHeadroom) * blockMs
+        // The p95 is the link's habit; the maximum is its worst recent stall.
+        // A Wi-Fi link that pauses for ~100 ms every few seconds has a small
+        // p95 and a large maximum, and it is the maximum that decides whether
+        // a stall's worth of packets arrives late and is thrown away. Cover
+        // whichever is larger.
+        var spread = p95JitterMs
+        if let maxJitterMs, maxJitterMs.isFinite, maxJitterMs > spread {
+            spread = maxJitterMs
+        }
+        let floorMs = spread + Double(blocksOfHeadroom) * blockMs
         return min(maximumMilliseconds, max(requestedMs, floorMs))
     }
 }

@@ -120,6 +120,19 @@ public final class PacketArrivalTracker: @unchecked Sendable {
         return (minimum, p05)
     }
 
+    /// Full spread of the window (latest arrival relative to schedule minus
+    /// earliest), ms. This is what a periodic ~100 ms Wi-Fi stall looks like:
+    /// it never moves the p95, and it is exactly what the buffer has to cover.
+    public var maxSpreadMilliseconds: Double? {
+        lock.lock()
+        let filled = count
+        guard filled >= max(8, deltas.count / 10) else { lock.unlock(); return nil }
+        var window = Array(deltas[0..<filled])
+        lock.unlock()
+        window.sort()
+        return Double(max(0, window[filled - 1] - window[0])) / 1_000_000
+    }
+
     public var p95SpreadMilliseconds: Double? {
         lock.lock()
         let filled = count

@@ -30,6 +30,8 @@ public final class PlayoutEngine: @unchecked Sendable {
         /// Arrival spread of the last few seconds of packets, in ms, or nil
         /// before enough have arrived. See `PacketArrivalTracker`.
         public var p95JitterMilliseconds: Double?
+        /// Full arrival spread of the window, ms (see `PacketArrivalTracker`).
+        public var maxJitterMilliseconds: Double?
         /// Smallest and 5th-percentile arrival slack over the window, ms.
         public var slackMilliseconds: (minimum: Double, p05: Double)?
         /// p95 / max gap between consecutive arrivals, ms.
@@ -290,6 +292,7 @@ public final class PlayoutEngine: @unchecked Sendable {
                  levelMilliseconds: level.isNaN ? buffer.fillMilliseconds : level / sampleRate * 1000,
                  fillMilliseconds: buffer.fillMilliseconds,
                  p95JitterMilliseconds: arrivalTracker.p95SpreadMilliseconds,
+                 maxJitterMilliseconds: arrivalTracker.maxSpreadMilliseconds,
                  slackMilliseconds: arrivalTracker.slackMilliseconds,
                  arrivalGapMilliseconds: arrivalTracker.arrivalGapMilliseconds,
                  ratio: ratioPublished.value,
