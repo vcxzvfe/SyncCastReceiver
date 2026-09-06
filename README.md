@@ -32,7 +32,15 @@ SyncCast (sender)                        SyncCastReceiver
 * **Rate**: two Macs' crystals differ by ~±100 ppm, which is a lost or
   duplicated sample every few seconds. The ring's fill level drives a PI loop
   that trims a 4-tap Hermite resampler by at most **±200 ppm** (0.35 cent —
-  inaudible). Only a level error past **±20 ms** causes a hard re-anchor.
+  inaudible). The level it holds is the one the timestamp anchor produced —
+  `target − device latency − transit`, measured over a 3 s settle window —
+  not the nominal `target − device latency`: transit is the network's, and a
+  loop that chased the nominal figure would sit at its +200 ppm stop and drag
+  playout late by one transit delay. Only a level error past **±20 ms** that
+  persists causes a hard re-anchor, and every re-anchor (cold start, level
+  error, starvation, target change) goes back through the timestamp mapping,
+  so it lands on the schedule rather than at a fixed distance behind whatever
+  burst arrived last.
 * **Loss**: a gap in the play-out timeline is zero-filled and counted; a
   packet that turns up out of order still lands in its own slot and takes its
   loss count back; a packet whose time has already passed is dropped as late.
@@ -189,7 +197,12 @@ a second, while a stream is running, the daemon logs and sends the sender a
 milliseconds, the current trim, the number of hard re-anchors split by cause
 (`reanchor_starved` / `reanchor_error`), the link's measured p95 arrival
 jitter, the target it is actually running at, and the packets it had to refuse
-(`overlap` / `far_future`).
+(`overlap` / `far_future`). The log line adds `hold=` (the level the loop is
+holding, or `settling` for the first seconds after an anchor), `extra=` (delay
+this side adds beyond the sender's target, when it had to raise it) and
+`lift=` (how far an anchor had to lift the cursor above the pure timestamp
+mapping to keep a minimum fill — a steady non-zero value means the clock
+offset estimate is biased).
 
 Those last two are about the SENDER, not about the link. `overlap` counts
 packets whose frames overlapped audio already buffered — a correct sender
