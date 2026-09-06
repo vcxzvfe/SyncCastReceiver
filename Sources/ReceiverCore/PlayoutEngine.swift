@@ -95,6 +95,12 @@ public final class PlayoutEngine: @unchecked Sendable {
     private let deviceLatencyFramesBox = AtomicInt64(0)
     private let holdPublished = AtomicDouble(.nan)
     private let anchorLiftPublished = AtomicDouble(0)
+    /// Arrival jitter the anchor must leave room for, in frames. Published
+    /// by the stats thread (the tracker sorts and locks, which the render
+    /// thread may not do); zero before the window has filled.
+    private let jitterMarginFramesBox = AtomicInt64(0)
+    /// The margin the current anchor was placed with. Render-thread only.
+    private var anchoredMarginFrames: Int64 = 0
     private let softwareGainBox = AtomicDouble(1.0)
     private let mutedBox = AtomicBool(false)
     private let clipBox = AtomicInt64(0)
@@ -248,6 +254,14 @@ public final class PlayoutEngine: @unchecked Sendable {
         if anchoredBox.value, abs(frames - previous) > Int64(WireFormat.framesPerPacket / 2) {
             targetMovedBox.value = true
         }
+    }
+
+    /// Tell the anchor how much arrival jitter the link shows (the tracker's
+    /// p95 spread), so a lift leaves room for it rather than for the bare
+    /// two render blocks. Called from the stats tick, not the render thread.
+    public func setJitterMargin(milliseconds: Double) {
+        let clamped = milliseconds.isFinite ? min(max(milliseconds, 0), 500) : 0
+        jitterMarginFramesBox.value = Int64((clamped / 1000 * sampleRate).rounded())
     }
 
     /// Frames of playout delay added here beyond `play_at_ns`.
@@ -552,6 +566,22 @@ public final class PlayoutEngine: @unchecked Sendable {
         }
         var reanchorReason: ClockFollowLoop.ReanchorReason?
         if case .reanchorNeeded(let reason) = outcome { reanchorReason = reason }
+        // The first anchor of a stream is placed before the link's jitter is
+        // known, so its lift (if any) left room for two render blocks and
+        // nothing else; a level that shallow underruns on every jitter peak.
+        // Once the settled level is in and the margin has grown by more than
+        // half a packet since the anchor was placed, re-anchor once with the
+        // room the link actually needs. One splice a few seconds into a
+        // stream, at most once per margin change, instead of a tick a second
+        // for its whole length.
+        if reanchorReason == nil, let hold = holdFrames {
+            let margin = jitterMarginFramesBox.value
+            let wanted = minimumFillFrames(renderFrames: frames) + margin
+            if margin - anchoredMarginFrames > Int64(WireFormat.framesPerPacket / 2),
+               hold < Double(wanted) {
+                reanchorReason = .target
+            }
+        }
         // Starvation with nothing arriving is not a fault a splice can fix.
         // Delivery has stopped — during the half second before an outright
         // pause is recognised, say — and re-anchoring lands the cursor on the
@@ -644,16 +674,21 @@ public final class PlayoutEngine: @unchecked Sendable {
     /// resampler and the settle window, so the level the mapping produced
     /// becomes the level the loop holds.
     ///
-    /// If the mapping would leave less than the minimum fill — the offset
-    /// estimate is biased, or the sender's stamps run ahead of its packets —
-    /// the cursor is lifted to the minimum instead, and the lift is reported
-    /// so a wrong offset shows up as a number rather than as clicks.
+    /// If the mapping would leave less than the minimum fill plus the link's
+    /// measured jitter — the target is smaller than the path can honour, the
+    /// offset estimate is biased, or the sender's stamps run ahead of its
+    /// packets — the cursor is lifted to that minimum instead, and the lift
+    /// is reported so the shortfall shows up as a number rather than as
+    /// clicks. A lift is latency the sender did not ask for; the honest
+    /// answer to a steady non-zero one is a larger target.
     private func anchorCursor(dacDeadlineNanos: UInt64, frames: Int) {
         let extraNanos = Int64((Double(extraDelayFrames) / sampleRate * 1_000_000_000).rounded())
         let senderNanos = UInt64(bitPattern:
             Int64(bitPattern: dacDeadlineNanos) &- offsetNanosBox.value &- extraNanos)
         buffer.anchorReadCursor(toSenderNanos: senderNanos)
-        let minimum = minimumFillFrames(renderFrames: frames)
+        let margin = jitterMarginFramesBox.value
+        anchoredMarginFrames = margin
+        let minimum = minimumFillFrames(renderFrames: frames) + margin
         let mapped = buffer.fillFrames
         var lift: Int64 = 0
         if mapped < minimum {

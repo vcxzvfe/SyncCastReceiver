@@ -513,6 +513,9 @@ public final class ReceiverDaemon: @unchecked Sendable {
     private func emitStats() {
         guard streaming else { return }
         StreamingMarker.touch()
+        if let jitter = engine.snapshot.p95JitterMilliseconds {
+            engine.setJitterMargin(milliseconds: jitter)
+        }
         applyTargetLatency(force: false)
         let snapshot = engine.snapshot
         let message = StatsMessage(late: snapshot.counters.late,
