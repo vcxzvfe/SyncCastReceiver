@@ -115,6 +115,7 @@ public final class ReceiverDaemon: @unchecked Sendable {
         self.requestedTargetMs = options.defaultTargetMilliseconds
         self.effectiveTargetMs = options.defaultTargetMilliseconds
         self.engine.setTargetLatency(milliseconds: options.defaultTargetMilliseconds)
+        self.engine.setRequestedTargetLatency(milliseconds: options.defaultTargetMilliseconds)
         self.audioSocket = AudioSocket(engine: engine) { [weak self] message in
             self?.log.warn("media socket: \(message)")
         }
@@ -309,6 +310,7 @@ public final class ReceiverDaemon: @unchecked Sendable {
             applyGain(linear: gain.linear, muted: gain.muted)
         case .latency(let latency):
             requestedTargetMs = Double(latency.targetMs)
+            engine.setRequestedTargetLatency(milliseconds: requestedTargetMs)
             lastTargetChangeNanos = nil
             let effective = applyTargetLatency(force: true)
             if effective > requestedTargetMs + 0.5 {
@@ -358,6 +360,7 @@ public final class ReceiverDaemon: @unchecked Sendable {
         loggedReanchorSequence = 0
         loggedReanchorTotal = 0
         engine.setTargetLatency(milliseconds: requestedTargetMs)
+        engine.setRequestedTargetLatency(milliseconds: requestedTargetMs)
         offsetEstimator.reset()
         pendingExchange = nil
         lastPingNanos = clock.nowNanos()
@@ -500,6 +503,11 @@ public final class ReceiverDaemon: @unchecked Sendable {
             + (snapshot.slackMilliseconds.map { String(format: " slack=min%.1f/p05%.1fms", $0.minimum, $0.p05) } ?? "")
             + (snapshot.arrivalGapMilliseconds.map { String(format: " gap=p95%.1f/max%.1fms", $0.p95, $0.maximum) } ?? "")
             + (snapshot.maxJitterMilliseconds.map { String(format: " maxjitter=%.1fms", $0) } ?? "")
+            + (snapshot.holdMilliseconds.map { String(format: " hold=%.1fms", $0) } ?? " hold=settling")
+            + (snapshot.extraDelayMilliseconds > 0.5
+                ? String(format: " extra=%.0fms", snapshot.extraDelayMilliseconds) : "")
+            + (snapshot.anchorLiftMilliseconds > 0.5
+                ? String(format: " lift=%.1fms", snapshot.anchorLiftMilliseconds) : "")
             + (snapshot.isIdle ? " idle" : "")
         lastStatsLine = line
         log.debug("stats \(line)")

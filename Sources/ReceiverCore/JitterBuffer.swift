@@ -81,6 +81,12 @@ public final class JitterBuffer: @unchecked Sendable {
     private let counters: UnsafeMutablePointer<SCRAtomicI64>   // 6 slots, see CounterSlot
     private let anchorNanos: UnsafeMutablePointer<SCRAtomicI64>
     private let anchorGeneration: UnsafeMutablePointer<SCRAtomicI64>
+    /// Incremented every time `anchorNanos` is (re)defined — the first packet
+    /// of a stream, a stream-ID change, a timestamp discontinuity. The render
+    /// side compares it with the epoch it anchored its cursor under: a cursor
+    /// placed under an older epoch is meaningless against the new frame
+    /// numbering and has to be placed again.
+    private let anchorEpoch: UnsafeMutablePointer<SCRAtomicI64>
 
     private enum CounterSlot: Int, CaseIterable {
         case accepted, late, lost, duplicate, reordered, underrun, overlap, farFuture
@@ -130,6 +136,7 @@ public final class JitterBuffer: @unchecked Sendable {
         self.counters = makeAtoms(CounterSlot.allCases.count, 0)
         self.anchorNanos = makeAtoms(1, 0)
         self.anchorGeneration = makeAtoms(1, 0)
+        self.anchorEpoch = makeAtoms(1, 0)
         self.recentSeq = [Int64](repeating: -1, count: Self.recentSeqSlots)
         let marks = UnsafeMutablePointer<UInt8>.allocate(capacity: capacityFrames)
         marks.initialize(repeating: 0, count: capacityFrames)
@@ -139,7 +146,7 @@ public final class JitterBuffer: @unchecked Sendable {
     deinit {
         for p in storage { p.deinitialize(count: capacityFrames); p.deallocate() }
         writeEnd.deallocate(); readCursor.deallocate(); counters.deallocate()
-        anchorNanos.deallocate(); anchorGeneration.deallocate()
+        anchorNanos.deallocate(); anchorGeneration.deallocate(); anchorEpoch.deallocate()
         occupancy.deinitialize(count: capacityFrames)
         occupancy.deallocate()
     }
@@ -162,6 +169,9 @@ public final class JitterBuffer: @unchecked Sendable {
     public var writeEndFrame: Int64 { scr_atomic_load_acquire(writeEnd) }
     public var readCursorFrame: Int64 { scr_atomic_load_acquire(readCursor) }
     public var isAnchored: Bool { scr_atomic_load_acquire(anchorGeneration) != 0 }
+    /// How many times the frame numbering has been (re)defined. See
+    /// `anchorEpoch` above; zero before the first packet.
+    public var anchorEpochValue: Int64 { scr_atomic_load_acquire(anchorEpoch) }
     /// Sender-domain nanoseconds that map to frame 0, or nil before the
     /// first packet.
     public var anchorPlayAtNanos: UInt64? {
@@ -211,6 +221,7 @@ public final class JitterBuffer: @unchecked Sendable {
         if scr_atomic_load_acquire(anchorGeneration) == 0 {
             scr_atomic_store_release(anchorNanos, Int64(bitPattern: header.playAtNanos))
             scr_atomic_store_release(writeEnd, 0)
+            scr_atomic_add_relaxed(anchorEpoch, 1)
             scr_atomic_store_release(anchorGeneration, 1)
         }
 
@@ -233,6 +244,7 @@ public final class JitterBuffer: @unchecked Sendable {
             resetStreamState(streamID: header.streamID)
             scr_atomic_store_release(anchorNanos, Int64(bitPattern: header.playAtNanos))
             scr_atomic_store_release(writeEnd, 0)
+            scr_atomic_add_relaxed(anchorEpoch, 1)
             scr_atomic_store_release(anchorGeneration, 1)
             writeFrames(at: 0, frames: frames, samples: samples)
             scr_atomic_store_release(writeEnd, Int64(frames))
@@ -328,6 +340,14 @@ public final class JitterBuffer: @unchecked Sendable {
         guard frames > 0 else { return 0 }
         let cap = capacityFrames
         let start = scr_atomic_load_acquire(readCursor)
+        // A cursor that has not been placed under the current anchor is not a
+        // position, and advancing it from `Int64.min / 4` is how a whole
+        // stream once played nine seconds of silence with a "fill" of 2⁶¹
+        // frames. Silence, no count, no advance — the owner re-anchors.
+        guard start != Self.unanchoredCursor else {
+            for ch in 0..<channelCount { out[ch].update(repeating: 0, count: frames) }
+            return 0
+        }
         let end = scr_atomic_load_acquire(writeEnd)
         // Frame indices below 0 predate the stream and were never written;
         // frames older than one ring have been overwritten. Both are silence.

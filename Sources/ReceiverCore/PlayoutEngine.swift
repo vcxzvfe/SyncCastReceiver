@@ -37,6 +37,19 @@ public final class PlayoutEngine: @unchecked Sendable {
         /// p95 / max gap between consecutive arrivals, ms.
         public var arrivalGapMilliseconds: (p95: Double, maximum: Double)?
         public var ratio: Double
+        /// The ring level the loop is holding, ms — the level the timestamp
+        /// anchor produced, measured after the settle window. Nil while
+        /// settling. This, not the nominal setpoint, is the loop's target:
+        /// see `render` for why.
+        public var holdMilliseconds: Double?
+        /// Extra playout delay this side adds beyond the sender's
+        /// `play_at_ns` (the effective target minus the requested one), ms.
+        public var extraDelayMilliseconds: Double
+        /// How far the last anchor had to LIFT the cursor above the pure
+        /// timestamp mapping because the mapping would have left the ring
+        /// with less than the minimum fill, ms. Zero on a healthy link; a
+        /// steady non-zero value means the clock offset is biased.
+        public var anchorLiftMilliseconds: Double
         public var isPlaying: Bool
         /// Render blocks rendered as silence because the link was idle. Not
         /// underruns: nothing was owed and nothing was missed.
@@ -75,7 +88,13 @@ public final class PlayoutEngine: @unchecked Sendable {
     private let offsetNanosBox = AtomicInt64(0)
     private let offsetValid = AtomicBool(false)
     private let targetFramesBox = AtomicInt64(0)
+    /// The target the SENDER asked for; `targetFramesBox` is the effective
+    /// one this side runs at. The difference is playout delay added here, on
+    /// top of `play_at_ns`.
+    private let requestedTargetFramesBox = AtomicInt64(0)
     private let deviceLatencyFramesBox = AtomicInt64(0)
+    private let holdPublished = AtomicDouble(.nan)
+    private let anchorLiftPublished = AtomicDouble(0)
     private let softwareGainBox = AtomicDouble(1.0)
     private let mutedBox = AtomicBool(false)
     private let clipBox = AtomicInt64(0)
@@ -132,6 +151,15 @@ public final class PlayoutEngine: @unchecked Sendable {
     /// stopped" from "the ring is dry because we are draining it faster than
     /// it fills" — only the second is a fault a splice can fix.
     private var lastRenderWriteEnd: Int64 = .min
+    /// The ring level the loop holds, in frames, once the anchor has
+    /// settled; nil while settling. Render-thread only.
+    private var holdFrames: Double?
+    /// Seconds of settle window left after the last anchor. Render-thread only.
+    private var settleRemainingSeconds: Double = 0
+    /// The buffer's anchor epoch the cursor was placed under. If the buffer
+    /// re-defines its frame numbering (stream restart, timestamp
+    /// discontinuity) the cursor has to be placed again. Render-thread only.
+    private var anchoredEpoch: Int64 = 0
 
     public init(channelCount: Int = WireFormat.channelCount,
                 sampleRate: Double = WireFormat.sampleRate,
@@ -159,6 +187,7 @@ public final class PlayoutEngine: @unchecked Sendable {
             UnsafeMutablePointer<UnsafeMutablePointer<Float>>.allocate(capacity: channelCount)
         for ch in 0..<channelCount { self.stagingWriteHeads[ch] = self.stagingBuffer[ch] }
         self.targetFramesBox.value = Int64(0.090 * sampleRate)   // spec default 90 ms
+        self.requestedTargetFramesBox.value = self.targetFramesBox.value
     }
 
     deinit {
@@ -205,6 +234,25 @@ public final class PlayoutEngine: @unchecked Sendable {
         if anchoredBox.value, abs(frames - previous) > Int64(WireFormat.framesPerPacket / 2) {
             targetMovedBox.value = true
         }
+    }
+
+    /// The target the sender stamped its packets for. Playout of frame F is
+    /// `play_at(F) + (effective − requested)`: the sender's schedule, plus
+    /// whatever this side had to add to cover the link. Defaults to the
+    /// effective target, i.e. no extra delay.
+    public func setRequestedTargetLatency(milliseconds: Double) {
+        let clamped = min(max(milliseconds, 10), 1_000)
+        let frames = Int64(clamped / 1000 * sampleRate)
+        let previous = requestedTargetFramesBox.value
+        requestedTargetFramesBox.value = frames
+        if anchoredBox.value, abs(frames - previous) > Int64(WireFormat.framesPerPacket / 2) {
+            targetMovedBox.value = true
+        }
+    }
+
+    /// Frames of playout delay added here beyond `play_at_ns`.
+    public var extraDelayFrames: Int64 {
+        max(0, targetFramesBox.value - requestedTargetFramesBox.value)
     }
 
     public var targetLatencyMilliseconds: Double {
@@ -296,6 +344,9 @@ public final class PlayoutEngine: @unchecked Sendable {
                  slackMilliseconds: arrivalTracker.slackMilliseconds,
                  arrivalGapMilliseconds: arrivalTracker.arrivalGapMilliseconds,
                  ratio: ratioPublished.value,
+                 holdMilliseconds: holdPublished.value.isNaN ? nil : holdPublished.value / sampleRate * 1000,
+                 extraDelayMilliseconds: Double(extraDelayFrames) / sampleRate * 1000,
+                 anchorLiftMilliseconds: anchorLiftPublished.value / sampleRate * 1000,
                  isPlaying: playingBox.value,
                  idleBlocks: Int(idleBlockBox.value),
                  idleResumes: Int(idleResumeBox.value),
@@ -363,6 +414,14 @@ public final class PlayoutEngine: @unchecked Sendable {
         lastIngestNanosBox.value = Int64(bitPattern: arrivalNanos)
 
         let outcome = buffer.ingest(header: header, samples: samples)
+        if case .restarted = outcome {
+            // The buffer has re-defined its frame numbering. A cursor placed
+            // under the old numbering is not a position any more; the next
+            // render places it again. (The render thread also checks the
+            // buffer's anchor epoch, so this is belt and braces.)
+            anchoredBox.value = false
+            arrivalTracker.reset()
+        }
         switch outcome {
         case .accepted, .reordered, .restarted:
             // Compare like with like: the packet's play time mapped into THIS
@@ -415,27 +474,59 @@ public final class PlayoutEngine: @unchecked Sendable {
         }
         idleBox.value = false
 
-        let targetFrames = levelSetpointFrames
+        // The buffer re-numbered its frames under us (stream restart or a
+        // timestamp discontinuity): the cursor has to be placed again.
+        if anchoredBox.value, buffer.anchorEpochValue != anchoredEpoch {
+            anchoredBox.value = false
+        }
         if !anchoredBox.value {
-            // Map the DAC deadline into the sender's clock and start playing
-            // exactly the frame that was stamped for it.
-            let senderNanos = UInt64(bitPattern: Int64(bitPattern: dacDeadlineNanos) &- offsetNanosBox.value)
-            buffer.anchorReadCursor(toSenderNanos: senderNanos)
-            resampler.reset()
-            loop.reset(fillFrames: Double(buffer.fillFrames))
-            stagingCount = 0
-            lastRenderWriteEnd = buffer.writeEndFrame
-            anchoredBox.value = true
+            anchorCursor(dacDeadlineNanos: dacDeadlineNanos, frames: frames)
             // The cold-start anchor already put the cursor where the new
             // target says; there is nothing left for a target jump to do.
             targetMovedBox.value = false
         }
 
+        // # What the loop holds
+        //
+        // The cursor is placed by the TIMESTAMP mapping: frame F leaves the
+        // DAC at `play_at(F) + extra`, which is the whole contract of the
+        // link and what keeps this leg aligned with the sender's own
+        // outputs. The ring level that produces is `target − deviceLatency −
+        // (transit + sender lag)` — it depends on the network, and it is
+        // never the nominal `target − deviceLatency`. A loop that chased the
+        // nominal figure would sit at its +200 ppm stop for as long as it
+        // took to walk the level up by one transit delay, dragging playout
+        // late by exactly that much and, on a link whose transit changes,
+        // re-anchoring for the difference. (A two-machine run showed the
+        // trim pinned at +200 ppm for the entire session.)
+        //
+        // So the loop's setpoint is the level the anchor PRODUCED, read off
+        // the control filter once it has settled: the loop's only job is to
+        // cancel the rate mismatch between the two clocks, i.e. to hold the
+        // anchor. Until the setpoint exists the error is zero by definition
+        // and the trim stays at unity.
         let fillFrames = Double(buffer.fillFrames)
         let dt = Double(frames) / sampleRate
+        let setpointFrames: Double
+        if let holdFrames {
+            setpointFrames = holdFrames
+        } else {
+            setpointFrames = loop.controlFillFrames.isNaN ? fillFrames : loop.controlFillFrames
+        }
         let outcome = loop.update(fillFrames: fillFrames,
-                                  targetFrames: Double(targetFrames),
+                                  targetFrames: setpointFrames,
                                   dt: dt)
+        if holdFrames == nil {
+            settleRemainingSeconds -= dt
+            if settleRemainingSeconds <= 0, !loop.controlFillFrames.isNaN {
+                // A settled level below the minimum fill is not a level worth
+                // holding — the anchor is starving, which the starvation
+                // rule will now be free to act on.
+                let hold = max(loop.controlFillFrames, Double(minimumFillFrames(renderFrames: frames)))
+                holdFrames = hold
+                holdPublished.value = hold
+            }
+        }
         var reanchorReason: ClockFollowLoop.ReanchorReason?
         if case .reanchorNeeded(let reason) = outcome { reanchorReason = reason }
         // Starvation with nothing arriving is not a fault a splice can fix.
@@ -456,17 +547,15 @@ public final class PlayoutEngine: @unchecked Sendable {
             reanchorReason = .target
         }
         if let reason = reanchorReason {
-            let errorMs = loop.errorMilliseconds(targetFrames: Double(targetFrames))
+            let errorMs = loop.errorMilliseconds(targetFrames: setpointFrames)
             let starved = loop.consecutiveStarvedBlocks
-            buffer.reanchorReadCursor(toLevelFrames: targetFrames)
-            // A splice puts the level back on the setpoint by construction; the
-            // loop's integrator and filtered levels describe the OLD excursion
-            // and would drive the fresh level straight back off it. Start over.
-            loop.reset(fillFrames: Double(targetFrames))
-            resampler.reset()
-            loop.reset(fillFrames: Double(targetFrames))
-            stagingCount = 0
-            lastRenderWriteEnd = buffer.writeEndFrame
+            // A splice goes back through the timestamp mapping — the same
+            // place the cold start came from — so it lands ON the schedule
+            // (with the current offset estimate, which may be what was
+            // wrong), rather than at a fixed distance behind the write head,
+            // which on a bursty link is wherever the last burst happened to
+            // end and replays audio that has already been heard.
+            anchorCursor(dacDeadlineNanos: dacDeadlineNanos, frames: frames)
             reanchorBox.add(1)
             switch reason {
             case .starved: reanchorStarvedBox.add(1)
@@ -518,6 +607,46 @@ public final class PlayoutEngine: @unchecked Sendable {
             }
         }
         stagingCount = remainder
+    }
+
+    /// The least the ring may hold behind the cursor for playout to work at
+    /// all: two render blocks (the one in flight and the next) plus half a
+    /// packet of write-head granularity.
+    private func minimumFillFrames(renderFrames: Int) -> Int64 {
+        Int64(2 * max(renderFrames, 1)) + Int64(WireFormat.framesPerPacket / 2)
+    }
+
+    /// Place the read cursor from the clock: the frame stamped for this DAC
+    /// deadline, less the extra delay this side adds. Resets the loop, the
+    /// resampler and the settle window, so the level the mapping produced
+    /// becomes the level the loop holds.
+    ///
+    /// If the mapping would leave less than the minimum fill — the offset
+    /// estimate is biased, or the sender's stamps run ahead of its packets —
+    /// the cursor is lifted to the minimum instead, and the lift is reported
+    /// so a wrong offset shows up as a number rather than as clicks.
+    private func anchorCursor(dacDeadlineNanos: UInt64, frames: Int) {
+        let extraNanos = Int64((Double(extraDelayFrames) / sampleRate * 1_000_000_000).rounded())
+        let senderNanos = UInt64(bitPattern:
+            Int64(bitPattern: dacDeadlineNanos) &- offsetNanosBox.value &- extraNanos)
+        buffer.anchorReadCursor(toSenderNanos: senderNanos)
+        let minimum = minimumFillFrames(renderFrames: frames)
+        let mapped = buffer.fillFrames
+        var lift: Int64 = 0
+        if mapped < minimum {
+            lift = minimum - mapped
+            buffer.reanchorReadCursor(toLevelFrames: minimum)
+        }
+        anchorLiftPublished.value = Double(lift)
+        resampler.reset()
+        loop.reset(fillFrames: Double(buffer.fillFrames))
+        stagingCount = 0
+        lastRenderWriteEnd = buffer.writeEndFrame
+        holdFrames = nil
+        holdPublished.value = .nan
+        settleRemainingSeconds = loop.tuning.settleSeconds
+        anchoredEpoch = buffer.anchorEpochValue
+        anchoredBox.value = true
     }
 
     private func emit(frames: Int,

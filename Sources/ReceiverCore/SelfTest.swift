@@ -94,9 +94,16 @@ public enum SelfTest {
     /// start pushes the trim into its ±200 ppm stop while the level walks to
     /// the setpoint, and it is the steady state after that which is worth
     /// measuring. It still runs in a few seconds of real time.
+    /// - Parameter transitNanos: how long every packet takes to get here after
+    ///   the sender put it on the wire. The steady scenario uses zero; a real
+    ///   link has some, and the point of `transitNanos > 0` is to prove that
+    ///   transit changes the ring LEVEL and not the playout TIME — the loop
+    ///   must hold the level the schedule produces, not walk it up to the
+    ///   nominal setpoint and drag playout late by one transit delay.
     public static func run(seconds: Double = 70,
                            warmupSeconds: Double = 20,
                            tuning: ClockFollowLoop.Tuning = ClockFollowLoop.Tuning(),
+                           transitNanos: UInt64 = 0,
                            emit: (String) -> Void = { _ in }) -> Report {
         var report = Report()
 
@@ -156,7 +163,7 @@ public enum SelfTest {
 
         for step in 0..<steps {
             // 1. Everything the sender would have transmitted by now.
-            while playAt(nextPacket) &- targetNanos &+ UInt64(bitPattern: trueOffset) <= localNow {
+            while playAt(nextPacket) &- targetNanos &+ UInt64(bitPattern: trueOffset) &+ transitNanos <= localNow {
                 let index = nextPacket
                 nextPacket += 1
                 if random.chance(oneIn: 400) { injectedDrops += 1; continue }         // packet loss
@@ -236,10 +243,12 @@ public enum SelfTest {
         // read cursor runs one device latency ahead of the DAC.
         let expectedLevelMs = targetMs - Double(deviceLatencyNanos) / 1_000_000
             + Double(WireFormat.framesPerPacket) / 2 / WireFormat.sampleRate * 1_000
+            - Double(transitNanos) / 1_000_000
         let bufferMs = snapshot.levelMilliseconds
         check("buffer at setpoint", abs(bufferMs - expectedLevelMs) < 5,
-              String(format: "%.1f ms (setpoint %.1f ms = target %.0f − device %.0f + half a packet)",
-                     bufferMs, expectedLevelMs, targetMs, Double(deviceLatencyNanos) / 1_000_000))
+              String(format: "%.1f ms (setpoint %.1f ms = target %.0f − device %.0f + half a packet − transit %.0f)",
+                     bufferMs, expectedLevelMs, targetMs, Double(deviceLatencyNanos) / 1_000_000,
+                     Double(transitNanos) / 1_000_000))
 
         let meanPpm = trimSum / Double(max(trimCount, 1))
         check("trim within ±200 ppm", trimWorst <= 200, String(format: "worst %.1f ppm", trimWorst))

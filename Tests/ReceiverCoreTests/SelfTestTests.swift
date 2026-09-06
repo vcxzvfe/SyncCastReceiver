@@ -12,6 +12,19 @@ final class SelfTestTests: XCTestCase {
         XCTAssertGreaterThan(report.checks.count, 8)
     }
 
+    /// Packets that take 30 ms to arrive must move the ring LEVEL down by
+    /// 30 ms and the playout TIME by nothing: the loop holds the level the
+    /// schedule produced instead of walking it up to the nominal setpoint
+    /// with the trim pinned at +200 ppm (which is what a two-machine run
+    /// over Wi-Fi showed for a whole session).
+    func testTransitDelayMovesTheLevelNotThePlayout() {
+        let report = SelfTest.run(transitNanos: 30_000_000)
+        for check in report.checks {
+            XCTAssertTrue(check.passed, "\(check.name): \(check.detail)")
+        }
+        XCTAssertGreaterThan(report.checks.count, 8)
+    }
+
     /// The scenario the field failure lives in: burst delivery with the
     /// occasional stall.
     func testBurstyArrivalSelfTestPasses() {

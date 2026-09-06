@@ -113,6 +113,11 @@ public struct ClockFollowLoop: Sendable {
         /// It is a knob only so the self-test can turn the guard OFF and
         /// prove its scenarios still have teeth without it.
         public var spliceWithoutNewAudio: Bool
+        /// How long after an anchor the level is allowed to settle before
+        /// the loop adopts it as the setpoint it holds. Long enough for the
+        /// control filter (`controlFilterSeconds`) to have forgotten the
+        /// reset value; the trim sits at unity meanwhile.
+        public var settleSeconds: Double
         /// Nominal device rate, used for the ms ↔ frames conversions.
         public var sampleRate: Double
 
@@ -128,9 +133,11 @@ public struct ClockFollowLoop: Sendable {
                     reanchorHoldSeconds: Double = 0.5,
                     starvedBlockLimit: Int = 2,
                     starvationConfirmMs: Double = 10,
-                    spliceWithoutNewAudio: Bool = false) {
+                    spliceWithoutNewAudio: Bool = false,
+                    settleSeconds: Double = 3.0) {
             precondition(sampleRate > 0)
             self.sampleRate = sampleRate
+            self.settleSeconds = max(0, settleSeconds)
             self.ki = naturalFrequency * naturalFrequency / sampleRate
             self.kp = 2 * dampingRatio * naturalFrequency / sampleRate
             self.maxRatioPpm = maxRatioPpm
