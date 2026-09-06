@@ -389,12 +389,35 @@ public final class PlayoutEngine: @unchecked Sendable {
         ingest(header: header, samples: samples, arrivalNanos: clock.nowNanos())
     }
 
+    @discardableResult
+    public func ingest(header: AudioPacketHeader, floatSamples: UnsafePointer<Float>) -> JitterBuffer.IngestOutcome {
+        ingest(header: header, floatSamples: floatSamples, arrivalNanos: clock.nowNanos())
+    }
+
     /// Ingest with an explicit arrival timestamp, so the offline self-test can
     /// drive the same arrival-jitter measurement from its simulated clock.
     @discardableResult
     public func ingest(header: AudioPacketHeader,
                        samples: UnsafePointer<Int16>,
                        arrivalNanos: UInt64) -> JitterBuffer.IngestOutcome {
+        ingest(header: header, arrivalNanos: arrivalNanos) {
+            buffer.ingest(header: header, samples: samples)
+        }
+    }
+
+    /// `f32le` payload. Same accounting as the Int16 path.
+    @discardableResult
+    public func ingest(header: AudioPacketHeader,
+                       floatSamples: UnsafePointer<Float>,
+                       arrivalNanos: UInt64) -> JitterBuffer.IngestOutcome {
+        ingest(header: header, arrivalNanos: arrivalNanos) {
+            buffer.ingest(header: header, floatSamples: floatSamples)
+        }
+    }
+
+    private func ingest(header: AudioPacketHeader,
+                        arrivalNanos: UInt64,
+                        write: () -> JitterBuffer.IngestOutcome) -> JitterBuffer.IngestOutcome {
         // A stretch with no packets at all is SILENCE, not a fault: the
         // sender stops writing when the programme stops, and the correct
         // rendering of that is zero-fill. But the schedule it left behind is
@@ -413,7 +436,7 @@ public final class PlayoutEngine: @unchecked Sendable {
         }
         lastIngestNanosBox.value = Int64(bitPattern: arrivalNanos)
 
-        let outcome = buffer.ingest(header: header, samples: samples)
+        let outcome = write()
         if case .restarted = outcome {
             // The buffer has re-defined its frame numbering. A cursor placed
             // under the old numbering is not a position any more; the next
@@ -662,8 +685,16 @@ public final class PlayoutEngine: @unchecked Sendable {
             let src = staging[ch]
             let dst = outputs[ch]
             for f in 0..<frames {
+                // Not clamped: the device's own volume (when the master is
+                // carried in hardware) is applied downstream of this buffer,
+                // in float, and a sample past ±1.0 here may well be inside
+                // full scale by the time it reaches the DAC — exactly as it
+                // would be on the sender's own outputs. It is COUNTED, so a
+                // hot signal shows up in `stats.clip` rather than being
+                // silently flattened one stage too early.
                 var v = src[f] * g
-                if v > 1.0 { v = 1.0; clips += 1 } else if v < -1.0 { v = -1.0; clips += 1 }
+                if !v.isFinite { v = 0 }
+                if v > 1.0 || v < -1.0 { clips += 1 }
                 dst[f] = v
                 g += stepGain
             }

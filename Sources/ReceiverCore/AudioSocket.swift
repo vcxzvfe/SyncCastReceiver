@@ -24,6 +24,7 @@ public final class AudioSocket: @unchecked Sendable {
     private var thread: Thread?
     private var expectedPeer: String?
     private var expectedStreamID: UInt32?
+    private var expectedFormat: WireFormat.SampleFormat = .int16
     private var counters = Counters()
     private let closing = AtomicBool(false)
 
@@ -120,6 +121,11 @@ public final class AudioSocket: @unchecked Sendable {
         stateLock.lock(); expectedPeer = host.map(PeerFilter.normalise); stateLock.unlock()
     }
 
+    /// The payload format negotiated in `hello` / `hello_ack`.
+    public func setExpectedFormat(_ format: WireFormat.SampleFormat) {
+        stateLock.lock(); expectedFormat = format; stateLock.unlock()
+    }
+
     public func setExpectedStreamID(_ streamID: UInt32?) {
         stateLock.lock(); expectedStreamID = streamID; stateLock.unlock()
     }
@@ -135,6 +141,7 @@ public final class AudioSocket: @unchecked Sendable {
         let maxDatagram = 2_048
         var packet = [UInt8](repeating: 0, count: maxDatagram)
         var samples = [Int16](repeating: 0, count: 4_096 * WireFormat.channelCount)
+        var floatSamples = [Float](repeating: 0, count: 4_096 * WireFormat.channelCount)
 
         while !closing.value {
             var from = sockaddr_storage()
@@ -163,11 +170,12 @@ public final class AudioSocket: @unchecked Sendable {
                 note { $0.rejectedPeer += 1 }
                 continue
             }
-            handle(packet: packet, byteCount: received, samples: &samples)
+            handle(packet: packet, byteCount: received, samples: &samples, floatSamples: &floatSamples)
         }
     }
 
-    private func handle(packet: [UInt8], byteCount: Int, samples: inout [Int16]) {
+    private func handle(packet: [UInt8], byteCount: Int,
+                        samples: inout [Int16], floatSamples: inout [Float]) {
         let header: AudioPacketHeader
         do {
             header = try packet.withUnsafeBytes { try AudioPacketHeader.decode($0) }
@@ -177,6 +185,7 @@ public final class AudioSocket: @unchecked Sendable {
         }
         stateLock.lock()
         let expected = expectedStreamID
+        let format = expectedFormat
         stateLock.unlock()
         if let expected, expected != header.streamID {
             note { $0.rejectedStream += 1 }
@@ -184,25 +193,42 @@ public final class AudioSocket: @unchecked Sendable {
         }
         let sampleCount = Int(header.frames) * WireFormat.channelCount
         guard sampleCount <= samples.count,
-              byteCount >= WireFormat.headerByteCount + sampleCount * 2 else {
+              byteCount >= WireFormat.headerByteCount + sampleCount * format.bytesPerSample else {
             note { $0.malformed += 1 }
             return
         }
         do {
             try packet.withUnsafeBytes { raw in
-                try samples.withUnsafeMutableBufferPointer { out in
-                    _ = try decodeInt16Payload(raw,
-                                               offset: WireFormat.headerByteCount,
-                                               sampleCount: sampleCount,
-                                               into: out.baseAddress!)
+                switch format {
+                case .int16:
+                    try samples.withUnsafeMutableBufferPointer { out in
+                        _ = try decodeInt16Payload(raw,
+                                                   offset: WireFormat.headerByteCount,
+                                                   sampleCount: sampleCount,
+                                                   into: out.baseAddress!)
+                    }
+                case .float32:
+                    try floatSamples.withUnsafeMutableBufferPointer { out in
+                        _ = try decodeFloat32Payload(raw,
+                                                     offset: WireFormat.headerByteCount,
+                                                     sampleCount: sampleCount,
+                                                     into: out.baseAddress!)
+                    }
                 }
             }
         } catch {
             note { $0.malformed += 1 }
             return
         }
-        _ = samples.withUnsafeBufferPointer { buffer in
-            engine.ingest(header: header, samples: buffer.baseAddress!)
+        switch format {
+        case .int16:
+            _ = samples.withUnsafeBufferPointer { buffer in
+                engine.ingest(header: header, samples: buffer.baseAddress!)
+            }
+        case .float32:
+            _ = floatSamples.withUnsafeBufferPointer { buffer in
+                engine.ingest(header: header, floatSamples: buffer.baseAddress!)
+            }
         }
     }
 

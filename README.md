@@ -41,6 +41,17 @@ SyncCast (sender)                        SyncCastReceiver
   error, starvation, target change) goes back through the timestamp mapping,
   so it lands on the schedule rather than at a fixed distance behind whatever
   burst arrived last.
+* **Payload format**: `s16le` (the v1 wire format) or `f32le`, negotiated
+  per stream — the sender asks in `hello`, the receiver echoes the format it
+  will decode in `hello_ack`. Float32 carries the sender's mix untouched:
+  the master level is applied on this side, so the signal on the wire is
+  pre-volume and can legitimately exceed full scale (a hot programme, an EQ
+  boost); Int16 had to clip it there. 3 Mbit/s on a LAN is nothing.
+* **IO buffer**: `--io-buffer <frames>` (default 256, 5.3 ms) asks the
+  output device for a smaller render quantum than macOS's default 512. Two
+  blocks are the floor of every playout target and one block is part of the
+  device latency, so this takes about 16 ms off the lowest usable target.
+  `--io-buffer 0` leaves the device alone.
 * **Loss**: a gap in the play-out timeline is zero-filled and counted; a
   packet that turns up out of order still lands in its own slot and takes its
   loss count back; a packet whose time has already passed is dropped as late.

@@ -15,13 +15,21 @@ public final class ReceiverDaemon: @unchecked Sendable {
         public var deviceQuery: String?
         public var port: UInt16
         public var defaultTargetMilliseconds: Double
+        /// IO buffer to ask the output device for, in frames; 0 leaves the
+        /// device's own setting alone. Two render blocks are the floor of
+        /// every playout target (`TargetLatencyPolicy`), and one block is
+        /// part of the device latency, so 512 frames (macOS's default,
+        /// 10.7 ms) costs about 30 ms of the budget where 256 costs 16.
+        public var ioBufferFrames: Int
 
         public init(name: String, deviceQuery: String?, port: UInt16,
-                    defaultTargetMilliseconds: Double = 90) {
+                    defaultTargetMilliseconds: Double = 90,
+                    ioBufferFrames: Int = 256) {
             self.name = name
             self.deviceQuery = deviceQuery
             self.port = port
             self.defaultTargetMilliseconds = defaultTargetMilliseconds
+            self.ioBufferFrames = ioBufferFrames
         }
     }
 
@@ -201,6 +209,20 @@ public final class ReceiverDaemon: @unchecked Sendable {
         volumeObserver = nil
         do {
             let resolved = try AudioDevices.resolve(query: options.deviceQuery)
+            if options.ioBufferFrames > 0 {
+                let before = AudioDevices.bufferFrames(resolved.id)
+                if before != options.ioBufferFrames {
+                    let status = AudioDevices.setBufferFrames(resolved.id, options.ioBufferFrames)
+                    let after = AudioDevices.bufferFrames(resolved.id)
+                    if status != noErr || after != options.ioBufferFrames {
+                        log.warn("could not set the IO buffer of \"\(resolved.name)\" to "
+                                 + "\(options.ioBufferFrames) frames (OSStatus \(status), device reports \(after)); "
+                                 + "the playout floor is two of its blocks")
+                    } else {
+                        log.info("IO buffer of \"\(resolved.name)\" set to \(after) frames (was \(before))")
+                    }
+                }
+            }
             let newOutput = AUHALOutput(device: resolved, engine: engine)
             try newOutput.start()
             device = resolved
@@ -343,6 +365,17 @@ public final class ReceiverDaemon: @unchecked Sendable {
             controlServer?.disconnectPeer(reason: detail)
             return
         }
+        let format: WireFormat.SampleFormat
+        if let requested = hello.format {
+            guard let known = WireFormat.SampleFormat(rawValue: requested) else {
+                log.warn("refusing \(peer): unsupported payload format \"\(requested)\"")
+                controlServer?.disconnectPeer(reason: "unsupported payload format \(requested)")
+                return
+            }
+            format = known
+        } else {
+            format = .int16
+        }
         guard startOutputIfNeeded(), let device, let output else {
             controlServer?.disconnectPeer(reason: "no output device available")
             return
@@ -368,6 +401,7 @@ public final class ReceiverDaemon: @unchecked Sendable {
         engine.resetCounters()
         audioSocket.setExpectedPeer(peer)
         audioSocket.setExpectedStreamID(hello.streamID)
+        audioSocket.setExpectedFormat(format)
         engine.setMuted(false)
         engine.startStream()
         streaming = true
@@ -379,10 +413,11 @@ public final class ReceiverDaemon: @unchecked Sendable {
                                   // The EFFECTIVE target, not the requested
                                   // one: the sender aligns its local legs on
                                   // this number, so it has to be the truth.
-                                  bufferMs: Int(engine.targetLatencyMilliseconds.rounded()))
+                                  bufferMs: Int(engine.targetLatencyMilliseconds.rounded()),
+                                  format: format.rawValue)
         controlServer?.send(.helloAck(ack))
         log.info("stream \(hello.streamID) from \"\(hello.name)\" at \(peer): "
-                 + "udp \(audioSocket.boundPort), target \(ack.bufferMs) ms, "
+                 + "udp \(audioSocket.boundPort), \(format.rawValue), target \(ack.bufferMs) ms, "
                  + "device latency \(String(format: "%.1f", output.outputLatencyMilliseconds)) ms")
         startVolumeObserverIfNeeded()
         publishStatus()

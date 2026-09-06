@@ -22,6 +22,8 @@ public struct CLIOptions: Equatable, Sendable {
     public var device: String?
     public var name: String = "Receiver"
     public var port: UInt16 = WireFormat.defaultControlPort
+    /// IO buffer to ask the output device for; 0 leaves it alone.
+    public var ioBufferFrames: Int = 256
     /// Flags to bake into the LaunchAgent, i.e. everything except the
     /// install verb itself.
     public var passthroughArguments: [String] = []
@@ -30,6 +32,7 @@ public struct CLIOptions: Equatable, Sendable {
         case unknownFlag(String)
         case missingValue(String)
         case badPort(String)
+        case badFrames(String)
         case conflictingActions
 
         public var description: String {
@@ -37,6 +40,7 @@ public struct CLIOptions: Equatable, Sendable {
             case .unknownFlag(let f): return "unknown option \(f)"
             case .missingValue(let f): return "\(f) needs a value"
             case .badPort(let v): return "\(v) is not a valid TCP port (0-65535)"
+            case .badFrames(let v): return "\(v) is not a valid IO buffer size (0, or 32-4096 frames)"
             case .conflictingActions: return "only one of --selftest/--install/--uninstall/--print-token/--doctor/--status may be given"
             }
         }
@@ -72,6 +76,13 @@ public struct CLIOptions: Equatable, Sendable {
                 guard let port = UInt16(v) else { throw ParseError.badPort(v) }
                 options.port = port
                 options.passthroughArguments += ["--port", v]
+            case "--io-buffer":
+                let v = try value(for: argument)
+                guard let frames = Int(v), frames == 0 || (32...4_096).contains(frames) else {
+                    throw ParseError.badFrames(v)
+                }
+                options.ioBufferFrames = frames
+                options.passthroughArguments += ["--io-buffer", v]
             case "--print-token": try setAction(.printToken)
             case "--selftest": try setAction(.selfTest)
             case "--install": try setAction(.install)
@@ -103,6 +114,9 @@ public struct CLIOptions: Equatable, Sendable {
       --name <friendly>    Name advertised over Bonjour. Default: Receiver
       --port <n>           TCP control port. Default: \(WireFormat.defaultControlPort);
                            0 picks an ephemeral port (the sender finds it via Bonjour).
+      --io-buffer <frames> IO buffer to ask the output device for. Default: 256
+                           (5.3 ms); 0 leaves the device's setting alone. Two of
+                           these blocks are the floor of every playout target.
       --print-token        Print the pairing token and exit.
       --selftest           Run the offline packet/scheduler/resampler self-test.
       --doctor             Report whether the Application Firewall will let this

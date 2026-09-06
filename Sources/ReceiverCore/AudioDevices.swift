@@ -115,6 +115,18 @@ public enum AudioDevices {
         return Int(frames)
     }
 
+    /// Ask the device for a different IO buffer. The device may round or
+    /// refuse; read `bufferFrames` back to see what it did.
+    @discardableResult
+    public static func setBufferFrames(_ deviceID: AudioDeviceID, _ frames: Int) -> OSStatus {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyBufferFrameSize,
+                                                 mScope: kAudioObjectPropertyScopeOutput,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        var value = UInt32(max(1, frames))
+        return AudioObjectSetPropertyData(deviceID, &address, 0, nil,
+                                          UInt32(MemoryLayout<UInt32>.size), &value)
+    }
+
     public static func outputLatencyFrames(_ deviceID: AudioDeviceID) -> Int {
         let latency = uint32Property(deviceID, kAudioDevicePropertyLatency, scope: kAudioObjectPropertyScopeOutput) ?? 0
         let safety = uint32Property(deviceID, kAudioDevicePropertySafetyOffset, scope: kAudioObjectPropertyScopeOutput) ?? 0

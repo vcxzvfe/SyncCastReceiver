@@ -6,12 +6,42 @@ public enum WireFormat {
     public static let sampleRate: Double = 48_000
     public static let channelCount = 2
     public static let framesPerPacket = 240          // 5 ms
-    public static let bytesPerSample = 2             // Int16 LE
+    public static let bytesPerSample = 2             // Int16 LE (the v1 default)
     public static let headerByteCount = 24
     public static var payloadByteCount: Int {
         framesPerPacket * channelCount * bytesPerSample
     }
     public static var packetByteCount: Int { headerByteCount + payloadByteCount }
+
+    /// Sample format of the UDP payload, negotiated in `hello` / `hello_ack`.
+    ///
+    /// `s16le` is the v1 wire format and the default when a sender says
+    /// nothing. `f32le` carries the sender's Float32 mix untouched: the
+    /// sender's master level is applied on THIS side (in hardware when the
+    /// device has it), so the signal on the wire is pre-volume and can
+    /// legitimately exceed full scale — a hot programme, an EQ boost — and an
+    /// Int16 payload would have to clip it where the sender's own outputs,
+    /// which scale before their DAC, do not. 3 Mbit/s instead of 1.5 on a
+    /// LAN is nothing.
+    public enum SampleFormat: String, Sendable, CaseIterable {
+        case int16 = "s16le"
+        case float32 = "f32le"
+
+        public var bytesPerSample: Int {
+            switch self {
+            case .int16: return 2
+            case .float32: return 4
+            }
+        }
+    }
+
+    public static func payloadByteCount(for format: SampleFormat) -> Int {
+        framesPerPacket * channelCount * format.bytesPerSample
+    }
+
+    public static func packetByteCount(for format: SampleFormat) -> Int {
+        headerByteCount + payloadByteCount(for: format)
+    }
     /// Bonjour service type. `_udp` because the media path is UDP; the
     /// advertised port is the TCP control port (see `hello_ack.udp_port`
     /// for the media port).
@@ -146,6 +176,45 @@ public func buildAudioPacket(header: AudioPacketHeader, samples: [Int16]) -> [UI
 /// Decode the interleaved Int16 LE payload into `out` (which must have room
 /// for `frames * channels` samples). Returns the sample count written.
 @discardableResult
+/// Decode an interleaved Float32 LE payload. Values are passed through as
+/// they are — including anything past ±1.0, which is the point of the format
+/// (see `WireFormat.SampleFormat`); non-finite values become silence so a
+/// corrupt packet cannot poison the DAC.
+public func decodeFloat32Payload(
+    _ bytes: UnsafeRawBufferPointer,
+    offset: Int,
+    sampleCount: Int,
+    into out: UnsafeMutablePointer<Float>
+) throws -> Int {
+    let needed = sampleCount * 4
+    guard bytes.count - offset >= needed else {
+        throw PacketParseError.payloadLengthMismatch(expected: needed, got: bytes.count - offset)
+    }
+    for i in 0..<sampleCount {
+        let o = offset + i * 4
+        let bits = UInt32(bytes[o]) | UInt32(bytes[o + 1]) << 8
+            | UInt32(bytes[o + 2]) << 16 | UInt32(bytes[o + 3]) << 24
+        let value = Float(bitPattern: bits)
+        out[i] = value.isFinite ? value : 0
+    }
+    return sampleCount
+}
+
+/// Build a packet with a Float32 payload (tests and the self-test).
+public func buildAudioPacket(header: AudioPacketHeader, floatSamples: [Float]) -> [UInt8] {
+    var out = [UInt8]()
+    out.reserveCapacity(WireFormat.headerByteCount + floatSamples.count * 4)
+    header.encode(into: &out)
+    for sample in floatSamples {
+        let bits = sample.bitPattern
+        out.append(UInt8(truncatingIfNeeded: bits))
+        out.append(UInt8(truncatingIfNeeded: bits >> 8))
+        out.append(UInt8(truncatingIfNeeded: bits >> 16))
+        out.append(UInt8(truncatingIfNeeded: bits >> 24))
+    }
+    return out
+}
+
 public func decodeInt16Payload(
     _ bytes: UnsafeRawBufferPointer,
     offset: Int,

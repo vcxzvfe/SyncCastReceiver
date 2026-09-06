@@ -10,9 +10,12 @@ public struct HelloMessage: Codable, Equatable, Sendable {
     public var channels: Int
     public var framesPerPacket: Int
     public var streamID: UInt32
+    /// Payload sample format the sender wants to use (`WireFormat.SampleFormat`
+    /// raw value). Absent = `s16le`, the v1 wire format.
+    public var format: String?
 
     enum CodingKeys: String, CodingKey {
-        case v, token, name, rate, channels
+        case v, token, name, rate, channels, format
         case framesPerPacket = "frames_per_packet"
         case streamID = "stream_id"
     }
@@ -23,10 +26,11 @@ public struct HelloMessage: Codable, Equatable, Sendable {
                 rate: Int = Int(WireFormat.sampleRate),
                 channels: Int = WireFormat.channelCount,
                 framesPerPacket: Int = WireFormat.framesPerPacket,
-                streamID: UInt32) {
+                streamID: UInt32,
+                format: String? = nil) {
         self.v = v; self.token = token; self.name = name; self.rate = rate
         self.channels = channels; self.framesPerPacket = framesPerPacket
-        self.streamID = streamID
+        self.streamID = streamID; self.format = format
     }
 }
 
@@ -64,9 +68,12 @@ public struct HelloAckMessage: Codable, Equatable, Sendable {
     public var deviceUID: String
     public var hwVolume: Bool
     public var bufferMs: Int
+    /// The payload format this receiver will decode, echoed so the sender
+    /// knows its request was honoured. Absent = `s16le` (a v1 receiver).
+    public var format: String?
 
     enum CodingKeys: String, CodingKey {
-        case v
+        case v, format
         case udpPort = "udp_port"
         case device
         case deviceUID = "device_uid"
@@ -75,9 +82,10 @@ public struct HelloAckMessage: Codable, Equatable, Sendable {
     }
 
     public init(v: Int = WireFormat.protocolVersion, udpPort: Int, device: String,
-                deviceUID: String, hwVolume: Bool, bufferMs: Int) {
+                deviceUID: String, hwVolume: Bool, bufferMs: Int, format: String? = nil) {
         self.v = v; self.udpPort = udpPort; self.device = device
         self.deviceUID = deviceUID; self.hwVolume = hwVolume; self.bufferMs = bufferMs
+        self.format = format
     }
 }
 

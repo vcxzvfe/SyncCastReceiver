@@ -137,7 +137,8 @@ log.info("pairing token: \(config.token)")
 let daemon = ReceiverDaemon(
     options: ReceiverDaemon.Options(name: config.name,
                                     deviceQuery: config.device,
-                                    port: options.port),
+                                    port: options.port,
+                                    ioBufferFrames: options.ioBufferFrames),
     config: config,
     log: log)
 

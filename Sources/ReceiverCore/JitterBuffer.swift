@@ -209,6 +209,24 @@ public final class JitterBuffer: @unchecked Sendable {
     @discardableResult
     public func ingest(header: AudioPacketHeader,
                        samples: UnsafePointer<Int16>) -> IngestOutcome {
+        ingest(header: header) { index, frames in
+            self.writeFrames(at: index, frames: frames, samples: samples)
+        }
+    }
+
+    /// Write one packet of interleaved Float32 (`f32le` on the wire). Values
+    /// are stored as they are; anything past ±1.0 is the sender's business
+    /// and is reported by the render side, not clipped here.
+    @discardableResult
+    public func ingest(header: AudioPacketHeader,
+                       floatSamples: UnsafePointer<Float>) -> IngestOutcome {
+        ingest(header: header) { index, frames in
+            self.writeFloatFrames(at: index, frames: frames, samples: floatSamples)
+        }
+    }
+
+    private func ingest(header: AudioPacketHeader,
+                        write: (_ index: Int64, _ frames: Int) -> Void) -> IngestOutcome {
         let frames = Int(header.frames)
         var restarted = false
 
@@ -246,7 +264,7 @@ public final class JitterBuffer: @unchecked Sendable {
             scr_atomic_store_release(writeEnd, 0)
             scr_atomic_add_relaxed(anchorEpoch, 1)
             scr_atomic_store_release(anchorGeneration, 1)
-            writeFrames(at: 0, frames: frames, samples: samples)
+            write(0, frames)
             scr_atomic_store_release(writeEnd, Int64(frames))
             bump(.accepted)
             return .restarted(index: 0)
@@ -292,7 +310,7 @@ public final class JitterBuffer: @unchecked Sendable {
             let current = load(.lost)
             if current > 0 { scr_atomic_store_release(counters.advanced(by: CounterSlot.lost.rawValue), current - 1) }
         }
-        writeFrames(at: index, frames: frames, samples: samples)
+        write(index, frames)
         if end > currentEnd { scr_atomic_store_release(writeEnd, end) }
         bump(.accepted)
         if restarted { return .restarted(index: index) }
@@ -415,6 +433,18 @@ public final class JitterBuffer: @unchecked Sendable {
             let slot = (base + f) & (cap - 1)
             for ch in 0..<channelCount {
                 storage[ch][slot] = Float(samples[f * channelCount + ch]) * scale
+            }
+            occupancy[slot] = 1
+        }
+    }
+
+    private func writeFloatFrames(at index: Int64, frames: Int, samples: UnsafePointer<Float>) {
+        let cap = capacityFrames
+        let base = Int(index & Int64(cap - 1))
+        for f in 0..<frames {
+            let slot = (base + f) & (cap - 1)
+            for ch in 0..<channelCount {
+                storage[ch][slot] = samples[f * channelCount + ch]
             }
             occupancy[slot] = 1
         }
