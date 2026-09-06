@@ -75,6 +75,8 @@ public struct ClockFollowLoop: Sendable {
         public var ki: Double
         /// Hard clamp on |ratio − 1|, in ppm.
         public var maxRatioPpm: Double
+        /// Level error ignored by the PI (ms each side of the setpoint).
+        public var errorDeadbandMs: Double
         /// Clamp on |d(ratio)/dt|, in ppm per second.
         public var slewPpmPerSecond: Double
         /// Time constant of the REPORTED fill EMA, seconds. Fast enough that
@@ -118,6 +120,7 @@ public struct ClockFollowLoop: Sendable {
                     naturalFrequency: Double = 0.15,
                     dampingRatio: Double = 1.2,
                     maxRatioPpm: Double = 200,
+                    errorDeadbandMs: Double = 0,
                     slewPpmPerSecond: Double = 400,
                     fillFilterSeconds: Double = 1.5,
                     controlFilterSeconds: Double = 3.0,
@@ -131,6 +134,7 @@ public struct ClockFollowLoop: Sendable {
             self.ki = naturalFrequency * naturalFrequency / sampleRate
             self.kp = 2 * dampingRatio * naturalFrequency / sampleRate
             self.maxRatioPpm = maxRatioPpm
+            self.errorDeadbandMs = errorDeadbandMs
             self.slewPpmPerSecond = slewPpmPerSecond
             self.fillFilterSeconds = fillFilterSeconds
             self.controlFilterSeconds = controlFilterSeconds
@@ -213,7 +217,18 @@ public struct ClockFollowLoop: Sendable {
             let beta = 1 - exp(-dt / max(tuning.controlFilterSeconds, 1e-6))
             controlFillFrames += beta * (fillFrames - controlFillFrames)
         }
-        let error = controlFillFrames - targetFrames
+        // Deadband: a Wi-Fi link swings the level by ±10–20 ms every few
+        // seconds no matter what the DAC rate does. Chasing that with a
+        // ±200 ppm actuator only winds the integrator into a stop; the loop's
+        // job is the slow clock drift, so ignore level error inside the band.
+        let rawError = controlFillFrames - targetFrames
+        let deadbandFrames = tuning.errorDeadbandMs / 1000.0 * tuning.sampleRate
+        let error: Double
+        if abs(rawError) <= deadbandFrames {
+            error = 0
+        } else {
+            error = rawError > 0 ? rawError - deadbandFrames : rawError + deadbandFrames
+        }
         let maxRatio = tuning.maxRatioPpm * 1e-6
 
         let reanchorFrames = tuning.reanchorErrorMs / 1000.0 * tuning.sampleRate

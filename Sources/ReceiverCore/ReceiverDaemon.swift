@@ -36,11 +36,14 @@ public final class ReceiverDaemon: @unchecked Sendable {
         /// while the same fight is still going on.
         static let externalChangeLogIntervalSeconds: Double = 5
         /// Smallest change to the effective target worth a splice.
-        static let targetChangeThresholdMs: Double = 5
+        // A re-target is a splice (audible). Only do it for a change worth
+        // hearing, and not more often than once a minute: the measured floor
+        // wanders by a few ms every second and used to drag the cursor with it.
+        static let targetChangeThresholdMs: Double = 20
         /// How long the effective target must hold still between changes.
         /// The jitter measurement moves continuously; re-targeting on every
         /// tick would be a splice per second.
-        static let targetChangeIntervalSeconds: Double = 10
+        static let targetChangeIntervalSeconds: Double = 60
         /// How often the "raised the target" line may repeat.
         static let targetClampLogIntervalSeconds: Double = 60
     }
