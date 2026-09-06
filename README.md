@@ -250,6 +250,21 @@ render blocks that ran dry: some are unavoidable on a link that stalls, and
 they cost a few milliseconds of silence each. `reanchor_*` is the one to
 watch — a re-anchor is a splice, and a healthy link has none.
 
+## Wi-Fi and AWDL
+
+If the receiver is on Wi-Fi and the stream stutters in a pattern — clean for
+a while, then a burst of late packets — measure the link before touching any
+audio setting: `ping -i 0.1 <router>` from the receiver Mac. Delays of
+~100 ms recurring every 0.524 s (512 TU) are AWDL, the peer-to-peer Wi-Fi
+behind AirDrop, Universal Control and Continuity: while `awdl0` is active the
+radio leaves the channel for that long, which is a 20 % duty cycle of
+blackouts and no playout target under ~150 ms survives it. `ifconfig awdl0 |
+grep status` says whether it is active; macOS re-enables it on a login, an
+AirDrop window or a nearby Mac's Universal Control, so
+`sudo scripts/awdl-guard.sh install` puts a root LaunchDaemon in place that
+keeps it down (and disables AirDrop / Universal Control on that Mac until
+`uninstall`).
+
 ## Silence
 
 A sender with nothing to play sends nothing. After half a second without a
