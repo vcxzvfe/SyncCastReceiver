@@ -114,6 +114,8 @@ public struct StatsMessage: Codable, Equatable, Sendable {
     /// Packets refused because they were stamped more than two seconds ahead
     /// of the newest frame buffered.
     public var farFuture: Int
+    public var slackMinMs: Double?
+    public var slackP05Ms: Double?
 
     enum CodingKeys: String, CodingKey {
         case late, lost, underrun, ratio, clip
@@ -124,12 +126,15 @@ public struct StatsMessage: Codable, Equatable, Sendable {
         case targetMs = "target_ms"
         case overlap
         case farFuture = "far_future"
+        case slackMinMs = "slack_min_ms"
+        case slackP05Ms = "slack_p05_ms"
     }
 
     public init(late: Int, lost: Int, underrun: Int, bufferMs: Double, ratio: Double, clip: Int,
                 reanchorStarved: Int = 0, reanchorError: Int = 0,
                 p95JitterMs: Double? = nil, targetMs: Double = 0,
-                overlap: Int = 0, farFuture: Int = 0) {
+                overlap: Int = 0, farFuture: Int = 0,
+                slackMinMs: Double? = nil, slackP05Ms: Double? = nil) {
         self.late = late; self.lost = lost; self.underrun = underrun
         self.bufferMs = bufferMs; self.ratio = ratio; self.clip = clip
         self.reanchorStarved = reanchorStarved
@@ -138,6 +143,8 @@ public struct StatsMessage: Codable, Equatable, Sendable {
         self.targetMs = targetMs
         self.overlap = overlap
         self.farFuture = farFuture
+        self.slackMinMs = slackMinMs
+        self.slackP05Ms = slackP05Ms
     }
 
     /// Decoded leniently: every field added after v1 defaults rather than
@@ -156,6 +163,8 @@ public struct StatsMessage: Codable, Equatable, Sendable {
         targetMs = try container.decodeIfPresent(Double.self, forKey: .targetMs) ?? 0
         overlap = try container.decodeIfPresent(Int.self, forKey: .overlap) ?? 0
         farFuture = try container.decodeIfPresent(Int.self, forKey: .farFuture) ?? 0
+        slackMinMs = try container.decodeIfPresent(Double.self, forKey: .slackMinMs)
+        slackP05Ms = try container.decodeIfPresent(Double.self, forKey: .slackP05Ms)
     }
 }
 

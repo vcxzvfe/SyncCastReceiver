@@ -483,7 +483,9 @@ public final class ReceiverDaemon: @unchecked Sendable {
                                        .map { ($0 * 100).rounded() / 100 },
                                    targetMs: (engine.targetLatencyMilliseconds * 10).rounded() / 10,
                                    overlap: snapshot.counters.overlap,
-                                   farFuture: snapshot.counters.farFuture)
+                                   farFuture: snapshot.counters.farFuture,
+                                   slackMinMs: snapshot.slackMilliseconds.map { ($0.minimum * 10).rounded() / 10 },
+                                   slackP05Ms: snapshot.slackMilliseconds.map { ($0.p05 * 10).rounded() / 10 })
         controlServer?.send(.stats(message))
         let jitter = message.p95JitterMs.map { String(format: "%.1fms", $0) } ?? "-"
         let line = "late=\(message.late) lost=\(message.lost) underrun=\(message.underrun) "
@@ -492,6 +494,7 @@ public final class ReceiverDaemon: @unchecked Sendable {
             + "clip=\(message.clip) reanchor=\(snapshot.reanchors)"
             + "(starved=\(message.reanchorStarved) error=\(message.reanchorError)) "
             + "p95jitter=\(jitter) target=\(String(format: "%.0f", message.targetMs))ms"
+            + (snapshot.slackMilliseconds.map { String(format: " slack=min%.1f/p05%.1fms", $0.minimum, $0.p05) } ?? "")
             + (snapshot.isIdle ? " idle" : "")
         lastStatsLine = line
         log.debug("stats \(line)")

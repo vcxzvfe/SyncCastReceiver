@@ -71,6 +71,24 @@ public final class PacketArrivalTracker: @unchecked Sendable {
 
     /// `p95 − min` of the window, in milliseconds, or nil until the window
     /// holds enough packets (a tenth of it) to be worth quoting.
+    /// How early packets are arriving relative to their own play time, in ms:
+    /// the smallest slack and the 5th percentile over the window. A negative
+    /// minimum means at least one packet in the window arrived after it was
+    /// due — the receiver's `late` counter, but with a magnitude attached, so
+    /// "late by 3 ms" and "late by 300 ms" stop looking the same.
+    public var slackMilliseconds: (minimum: Double, p05: Double)? {
+        lock.lock()
+        let filled = count
+        guard filled >= 8 else { lock.unlock(); return nil }
+        var window = Array(deltas[0..<filled])
+        lock.unlock()
+        window.sort()   // ascending arrival − playAt == descending slack
+        let p05Index = min(filled - 1, Int((Double(filled - 1) * 0.95).rounded()))
+        let minimum = Double(-window[filled - 1]) / 1_000_000
+        let p05 = Double(-window[p05Index]) / 1_000_000
+        return (minimum, p05)
+    }
+
     public var p95SpreadMilliseconds: Double? {
         lock.lock()
         let filled = count

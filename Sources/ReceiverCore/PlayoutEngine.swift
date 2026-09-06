@@ -30,6 +30,8 @@ public final class PlayoutEngine: @unchecked Sendable {
         /// Arrival spread of the last few seconds of packets, in ms, or nil
         /// before enough have arrived. See `PacketArrivalTracker`.
         public var p95JitterMilliseconds: Double?
+        /// Smallest and 5th-percentile arrival slack over the window, ms.
+        public var slackMilliseconds: (minimum: Double, p05: Double)?
         public var ratio: Double
         public var isPlaying: Bool
         /// Render blocks rendered as silence because the link was idle. Not
@@ -286,6 +288,7 @@ public final class PlayoutEngine: @unchecked Sendable {
                  levelMilliseconds: level.isNaN ? buffer.fillMilliseconds : level / sampleRate * 1000,
                  fillMilliseconds: buffer.fillMilliseconds,
                  p95JitterMilliseconds: arrivalTracker.p95SpreadMilliseconds,
+                 slackMilliseconds: arrivalTracker.slackMilliseconds,
                  ratio: ratioPublished.value,
                  isPlaying: playingBox.value,
                  idleBlocks: Int(idleBlockBox.value),
